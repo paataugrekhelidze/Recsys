@@ -118,7 +118,8 @@ class VAEEncoder(nn.Module):
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             nn.init.xavier_normal_(module.weight)
-            nn.init.zeros_(module.bias)
+            # nn.init.zeros_(module.bias)
+            nn.init.trunc_normal_(module.bias, mean=0.0, std=0.001, a=-0.002, b=0.002)
     
     # returns mean, variance
     def forward(self, x):
@@ -136,7 +137,7 @@ class VAEEncoder(nn.Module):
         # l2 magnitude = sqrt(x_0^2 + x_1^2 + .....)
         x = F.normalize(x, p=2, dim=1) # same as x / torch.norm(x, p=2, dim=1)
         x = self.dropout(x)
-        x = F.relu(self.hidden_layer(x))
+        x = F.tanh(self.hidden_layer(x))
         out = self.latent_layer(x)
         return out
 
@@ -158,7 +159,8 @@ class VAEDecoder(nn.Module):
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             nn.init.xavier_normal_(module.weight)
-            nn.init.zeros_(module.bias)
+            # nn.init.zeros_(module.bias)
+            nn.init.trunc_normal_(module.bias, mean=0.0, std=0.001, a=-0.002, b=0.002)
     
     # returns mean, variance
     def forward(self, z):
