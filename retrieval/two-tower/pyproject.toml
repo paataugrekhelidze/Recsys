@@ -1,0 +1,16 @@
+[project]
+name = "two-tower"
+version = "0.1.0"
+description = "Two Tower Retrieval"
+readme = "README.md"
+requires-python = ">=3.11, <3.12"
+dependencies = [
+    "datasets>=4.4.1",
+    "faiss-cpu==1.7.4",
+    "ipykernel>=7.1.0",
+    "matplotlib>=3.10.8",
+    "polars>=1.36.1",
+    "scikit-learn>=1.8.0",
+    "torch>=2.9.1",
+    "tqdm>=4.67.1",
+]
