@@ -67,12 +67,25 @@ The Two-Tower Model consists of:
         -   pre-computed audio embedding.
         -   track release date (not available)
 
-### Experiments
+### Retrieval
 
-### Serving
+Given a user request, we use query tower to generate a query embedding, which is used to look up the top k item embeddings. In order to make this process faster, item embeddings should be stored in a data structure that allows fast retrieval. The most accurate algorithm would be to use knn, but brute‑force search over millions of items is very expensive (O(NxD) time and O(NxDx4) memory). There are many tools that approximate knn (ANN) using various techniques. They often trade off between speed, memory, and accuracy: ANNOY (Spotify), Scann(Google), Faiss(Meta). I chose Faiss because it offers many techniques to experiment with. Specifically, I use IVF to cluster item embeddings (speed) + PQ to make it memory efficient.
 
-### Monitoring?!?!
+### Concepts covered
+- In-Batch Negative Sampling
+- Bias correction
+- Frequency Estimation using hashes and weighted moving average
+- Index Table techniques: IVF, PQ, HNSW
 
 
+### Links
+- [Deep Neural Networks for YouTube Recommendations (2016)](https://dl.acm.org/doi/pdf/10.1145/2959100.2959190)
+- [Sampling-Bias-Corrected Neural Modeling for Large Corpus
+Item Recommendations (2019)](https://storage.googleapis.com/gweb-research2023-media/pubtools/5716.pdf)
+- [Yandex/Yambda dataset](https://arxiv.org/abs/2505.22238)
+- [Faiss Documentation](https://faiss.ai/index.html)
+- [IVF](https://medium.com/data-science/similarity-search-blending-inverted-file-index-and-product-quantization-a8e508c765fa)
+- [PQ](https://medium.com/data-science/similarity-search-product-quantization-b2a1a6397701)
+- [HNSW+IVF+PQ](https://medium.com/data-science/similarity-search-part-4-hierarchical-navigable-small-world-hnsw-2aad4fe87d37)
 
 

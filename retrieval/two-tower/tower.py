@@ -519,10 +519,10 @@ class TowerSolver:
 
         total_loss = 0
         nbatches = len(self.data)
-        counter = 0
+        # counter = 0
         for query, item, reward in self.data:
-            print(f"[{counter}/{nbatches}]")
-            counter += 1
+            # print(f"[{counter}/{nbatches}]")
+            # counter += 1
             query = {k: v.to(self.device) for k, v in query.items()}
             item = {k: v.to(self.device) for k, v in item.items()}
             reward = reward.to(self.device)
