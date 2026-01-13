@@ -55,9 +55,8 @@ The Two-Tower Model consists of:
         -   `user_id` embedding.
         -   age, gender, demographics, device... (not available)
     -   **Other**
-        -   Example Age/age of request (Train: Train_max_timestamp - event_timestamp; Test: 0 or -1.e-9 "what is most likely to be listened to right now")
-            - Example age captures what was popular "n days" ago and learns what is relevant at "day 0". If a model sees a track being popular 30 days ago and no longer popular last 10 days, it will learn not to give higher relevance at serve time (day = 0) compared to other tracks that were popular more recently (e.g. last 5 days)
-
+        -   Example Age/age of request (Train (time since last interaction, not upload time): Train_max_timestamp - event_timestamp; Test: 0 or -1.e-9 "what is most likely to be listened to right now")
+            - Example age captures time dependent trendiness of an item: video A might have had a lot more overall interactions than video B, but interactions for video A were primarily 30 days ago whereas interactions for video B were 1-2 days ago. During training, model learns that when age is close to 0, probability of click is high for new/trending videos. When age is high, probability of click is high for older videos. In this case, during inference, when age = 0, model will give higher probability to video B because it was trending more recently. without this feature, model would not capture time dependent trends and would predict average probability over time, which is higher for older videos since they have more time to accumulate interactions.
 -   **Item (Candidate) Tower**: Encodes a potential candidate item.
     -   **Item Features**:
         -   `item_id` embedding.
