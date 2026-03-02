@@ -1,0 +1,13 @@
+[project]
+name = "moe"
+version = "0.1.0"
+description = "multi-task MoE implementation"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=4.5.0",
+    "ipykernel>=7.1.0",
+    "polars>=1.37.1",
+    "scikit-learn>=1.8.0",
+    "torch>=2.10.0",
+]
