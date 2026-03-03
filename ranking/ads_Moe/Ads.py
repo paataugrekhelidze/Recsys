@@ -196,7 +196,7 @@ class FinalRankerMMoE(nn.Module):
 
                 # define noise weights
                 # for simplicity I am just making it a single learnable layer
-                # within a layer, there as many gates as # of heads
+                # within a layer, there are as many gates as # of heads
                 if l == 0:
                     noise = nn.Linear(in_features=input_size, out_features=expert_num, bias=False)
                 else:
@@ -219,8 +219,8 @@ class FinalRankerMMoE(nn.Module):
 
         # 3 separate strategies to balance expert utilization: importance loss, load loss (if sparse MoE), and gate dropout
         # importance loss tries to minimize variance of sum of softmax scores across experts per batch, so given a batch, if we add up scores from the gate softmax, total sum of weights across experts in a batch is forced to be similar
-        # load loss tries to minimize variance of sum of probabilities of the softmax output > top_k for a given expert across the batch, so each expert receive similar amount of probability of being > top_k
-        # gate dropout randomly drops the scores before the softmax, preventing gate polarization (over-reliance on specific experts)
+        # load loss tries to minimize variance of sum of probabilities of the softmax output > top_k across experts per batch, so each expert receives similar amount of probability of being > top_k
+        # gate dropout randomly drops the scores before the softmax, preventing gate polarization (over-reliance on any specific expert)
 
         # list output for each task
         out = list() # I x [(B, E)]
@@ -299,7 +299,7 @@ class FinalRankerMMoE(nn.Module):
         # within each layer, run gates for separate tasks
         # for each task, calculate weighted sum of experts in each layer
         # record sum of gate scores across batch for importance loss
-        # record sum of gate probabilites of > kth_greatesd across batch for load loss
+        # record sum of gate probabilites of > kth_greatest across batch for load loss
 
         importance = list()
         load = list()
@@ -378,18 +378,10 @@ class FinalRankerMMoE(nn.Module):
                 
         return task_out
     
-class DLRMTower(nn.Module):
-    """
-    Defines Bottom MLP + interaction layer for independent user and ad towers in early-stage model. 
-    Creating user and ad embeddings on historic features independently will make 
-    the architecture less expressive since we are not crossing features from the beginning (late interaction). The benefit of it
-    is that it allows caching for batch features, which will improve inference latency for early-stage ranker. 
-    If the constraints allow, this will not be used in the final ranker.
-    """
-    def __init__(self, bottom_mlp_layers, projection_layer, dense_num, sparse_num, emb_layers, device):
+class EmbeddingLayer(nn.Module):
+    """Modularize Embedding layer so the same tables can be shared across DLRMTowers"""
+    def __init__(self, emb_layers, emb_dim):
         super().__init__()
-        self.device = device
-
         # initialize embedding tables for sparse features
         # Note: campaign feature needs a single embedding per sample (candidate id), 
         # last_n clicks and conversions need mean of embedding bag from the same table (history per sample)
@@ -398,9 +390,22 @@ class DLRMTower(nn.Module):
         for emb_name, num_emb in emb_layers.items():
             # by default, quotient and remainder are combined with mult
             # by default, bag is aggregated with mean
-            self.embs[emb_name] = QREmbeddingBag(num_categories=num_emb, embedding_dim=bottom_mlp_layers[-1], num_collisions=int(math.sqrt(num_emb)))
+            self.embs[emb_name] = QREmbeddingBag(num_categories=num_emb, embedding_dim=emb_dim, num_collisions=int(math.sqrt(num_emb)))
+
+class DLRMTower(nn.Module):
+    """
+    Defines Bottom MLP + interaction layer for independent user and ad towers in early-stage model. 
+    Creating user and ad embeddings on historic features independently will make 
+    the architecture less expressive since we are not crossing features from the beginning (late interaction). The benefit of it
+    is that it allows caching for batch features, which will improve inference latency for early-stage ranker. 
+    If the constraints allow, this will not be used in the final ranker.
+    """
+    def __init__(self, bottom_mlp_layers, projection_layer, dense_num, sparse_num, embs, device):
+        super().__init__()
+        self.device = device
+        self.projection_layer = projection_layer
+        self.embs = embs
             
-        
         # initialize bottom mlp
         self.bottom_mlp = None
         if dense_num:
@@ -456,10 +461,10 @@ class DLRMTower(nn.Module):
 
         return combined
 
-    def forward(self, x, emb_indices, emb_offsets):
+    def forward(self, dense, emb_indices, emb_offsets):
         """
         Args:
-            x (torch.Tensor): dense input features.
+            dense (torch.Tensor): dense input features.
             emb_indices dict[torch.Tensor]: embedding indices for k categories and B batch size -> (B+M, ) where M > 0 occurs for historic features.
             emb_offsets dict[torch.Tensor]: embedding offsets for k categories and B batch size -> (B, ).
         Returns:
@@ -468,11 +473,13 @@ class DLRMTower(nn.Module):
         
         # step 1: score bottom MLP for dense features, skip if dense features not available.
         b_mlp_out = None
-        if x is not None:
+        if dense is not None:
             # (B, input) -> (B, D)
-            b_mlp_out = self.bottom_mlp(x)
+            b_mlp_out = self.bottom_mlp(dense)
 
-        B = emb_offsets["last_n_click_campaigns_1D_offset"].shape[0]
+        # not the prettiest way to get the batch size
+        B = emb_indices["uid" if "uid" in emb_indices else "campaign"].shape[0]
+
         # step 2: embedding lookup across all sparse features
         emb_out = []
         for k in emb_indices.keys():
@@ -490,3 +497,97 @@ class DLRMTower(nn.Module):
 
         # projection
         return self.projection(z)
+    
+class EarlyRanker(nn.Module):
+    """The following early-stage multi-task ranker architecture is inspired by the Meta paper [6]. It uses DLRM towers for 
+    efficient user and ad feature transformation and caching, then defines a simply shared-bottom multi-task heads. Goal is to keep the
+    model simple (fast) but expressive (accurate).
+    
+    Architecture:
+    [DLRMTower(user); DLRMTower(ad); DLRMTower(context)] -> Shared-DNN -> Task Heads (CTR, CTR distill, CVR, CVR distill)
+    """
+
+    def __init__(self, shared_dims = [512, 256], task_dims = [[128, 64, 1], [128, 64, 1], [128, 64, 1], [128, 64, 1]], u_params = None, ad_params = None, c_params = None):
+        """
+        Initialize the early-stage ranker params
+        Args:
+            shared_dims (list): MLP layer dimensions for shared DNN.
+            task_dims (list): MLP layer dimensions for task specific DNN.
+            u_params (dict): dict specifying DLRMTower parameters for user features.
+            ad_params (dict): dict specifying DLRMTower parameters for ad features.
+            c_params (dict): dict specifying DLRMTower parameters for context features.
+        """
+        super().__init__()
+        self.task_dims = task_dims
+        shared_in = 0
+        # initialize DLRM Towers
+        if u_params:
+            self.UTower = DLRMTower(**u_params)
+            shared_in += self.UTower.projection_layer
+        if ad_params:
+            self.AdTower = DLRMTower(**ad_params)
+            shared_in += self.AdTower.projection_layer
+        if c_params:
+            self.CTower = DLRMTower(**c_params)
+            shared_in += self.CTower.projection_layer
+
+
+        # initialize shared DNN
+        self.shared = nn.ModuleList()
+        for i in range(len(shared_dims)):
+            self.shared.append(nn.Linear(in_features=shared_in if i == 0 else shared_dims[i-1], out_features=shared_dims[i], bias=True))
+            if i < len(shared_dims)-1:
+                self.shared.append(nn.ReLU())
+        self.shared = nn.Sequential(*self.shared) # in_features = M*P, out_features =  D, where M is number of DLRM towers, P is projection dim, D is output dim of shared DNN
+
+        # initialize task heads
+        self.task_heads = nn.ModuleList() # I x [MLP]
+        for task in range(len(task_dims)):
+            head = nn.ModuleList()
+            for i in range(len(task_dims[task])):
+                head.append(nn.Linear(in_features=shared_dims[-1] if i == 0 else task_dims[task][i-1], out_features=task_dims[task][i], bias = True))
+                if i < len(task_dims[task])-1:
+                    head.append(nn.ReLU())
+            self.task_heads.append(nn.Sequential(*head))
+    
+    def forward(self, cache, x):
+        """forward pass takes advantage of cached values (e.g. user and ad embeddings) if available
+        Args:
+            cache dict(torch.Tensor): dict of cached output values of DLRMTowers of shape (B, P), where P is the output dim of a tower
+            x dict(dict(torch.Tensor, torch.Tensor, torch.Tensor)): dict of DLRMTower input tensor dict of shape [(B, M), (B, M), (B, M)] for dense, emb_indicies, and emb_offsets. 
+        Returns:
+            List of Tensors of shape T x [(B, D)] where T is the number of tasks, B is batch, D is the output dim of the task.
+        """
+
+        # Forward are use cached DLRMTower Embeddings
+        user = cache["user"] if cache and "user" in cache else None
+        ad = cache["ad"] if cache and "ad" in cache else None
+        context = cache["context"] if cache and "context" in cache else None
+        
+        if user is None and "user" in x:
+            user = self.UTower(**x["user"])
+        if ad is None and "ad" in x:
+            ad = self.AdTower(**x["ad"])
+        if context is None and "context" in x:
+            context = self.CTower(**x["context"])
+        
+        combined = list()
+        if user is not None:
+            combined.append(user)
+        if ad is not None:
+            combined.append(ad)
+        if context is not None:
+            combined.append(context)
+        
+        combined = torch.cat(combined, dim=1) # was missing dim=1 -> (B, P_u + P_ad + P_c)
+
+        # Forward shared DNN
+        shared_out = self.shared(combined)
+
+        # Forward task heads
+        NUM_TASKS = len(self.task_dims)
+        task_out = list()
+        for task in range(NUM_TASKS):
+            task_out.append(self.task_heads[task](shared_out))
+        
+        return task_out
