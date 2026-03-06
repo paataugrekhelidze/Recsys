@@ -3,6 +3,8 @@ import datasets
 import torch.nn as nn
 from tricks.qr_embedding_bag import QREmbeddingBag
 import math
+import os
+import time
 
 class AdsDataset(torch.utils.data.Dataset):
     def __init__(self, data: datasets.arrow_dataset.Dataset,):
@@ -104,6 +106,13 @@ class FinalRankerMMoE(nn.Module):
         self.gates, self.noises = self.init_gates(input_size = input_size, layers = layers, task_num = len(task_dims), gate_dims = gate_dims, expert_num = expert_num, expert_dims = expert_dims)
         self.task_heads = self.init_heads(expert_dims = expert_dims, task_dims = task_dims)
 
+        # initialize weights
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        if isinstance(module, (torch.nn.Linear, torch.nn.Embedding, torch.nn.EmbeddingBag)):
+            torch.nn.init.xavier_normal_(module.weight)
+
 
 
     def init_experts(self, input_size, layers, expert_num, expert_dims, device):
@@ -155,8 +164,6 @@ class FinalRankerMMoE(nn.Module):
         return task_heads
     
 
-    # MUST BE UPDATED, CURRENTLY EACH LAYER ONLY HAS GATES FOR PARTICULAR TASK
-    # INSTEAD WE NEED GATES FOR EACH EXPERT IN NEXT LAYER, I THINK...
     def init_gates(self, input_size, layers, task_num, gate_dims, expert_num, expert_dims):
         # for each layer l, create h gates, one for each expert or task in next layer
         gates = nn.ModuleList()
@@ -429,6 +436,13 @@ class DLRMTower(nn.Module):
         proj_in = (bottom_mlp_layers[-1] if dense_num else 0) + interaction_out
         self.projection = nn.Linear(in_features=proj_in, out_features=projection_layer, bias=True, device=device)
 
+        # initialize weights
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        if isinstance(module, (torch.nn.Linear, torch.nn.Embedding, torch.nn.EmbeddingBag)):
+            torch.nn.init.xavier_normal_(module.weight)
+
     def _interact(self, dense, sparse):
         """
         The following interact operation assumes only dot interactions between sparse and dense features
@@ -549,27 +563,42 @@ class EarlyRanker(nn.Module):
                 if i < len(task_dims[task])-1:
                     head.append(nn.ReLU())
             self.task_heads.append(nn.Sequential(*head))
+        
+        # initialize weights
+        self.apply(self._init_weights)
     
-    def forward(self, cache, x):
+    def _init_weights(self, module):
+        if isinstance(module, (torch.nn.Linear, torch.nn.Embedding, torch.nn.EmbeddingBag)):
+            torch.nn.init.xavier_normal_(module.weight)
+    
+    def forward(self, cache = None, x = None):
         """forward pass takes advantage of cached values (e.g. user and ad embeddings) if available
         Args:
-            cache dict(torch.Tensor): dict of cached output values of DLRMTowers of shape (B, P), where P is the output dim of a tower
-            x dict(dict(torch.Tensor, torch.Tensor, torch.Tensor)): dict of DLRMTower input tensor dict of shape [(B, M), (B, M), (B, M)] for dense, emb_indicies, and emb_offsets. 
+            cache (dict[str, torch.Tensor] | None): dict of cached DLRMTower output tensors of shape (B, P),
+                where P is the projection dim of a tower. Keys: "user", "ad", "context".
+            x (dict[str, dict]): dict keyed by tower name ("user", "ad", "context"), each value is a dict with:
+                - "dense"       (torch.Tensor | None): dense input of shape (B, M), or None if no dense features.
+                - "emb_indices" (dict[str, torch.Tensor]): sparse feature indices;
+                                  scalar features -> (B,), historic bag features -> (B+M,) flattened 1D, where M >= 0.
+                - "emb_offsets" (dict[str, torch.Tensor]): cumulative bag offsets for historic features -> (B,).
+                                  scalar features do not need entries here (arange fallback used in DLRMTower).
         Returns:
-            List of Tensors of shape T x [(B, D)] where T is the number of tasks, B is batch, D is the output dim of the task.
+            list[torch.Tensor]: T tensors of shape (B, D), one per task head.
         """
 
-        # Forward are use cached DLRMTower Embeddings
-        user = cache["user"] if cache and "user" in cache else None
-        ad = cache["ad"] if cache and "ad" in cache else None
-        context = cache["context"] if cache and "context" in cache else None
-        
-        if user is None and "user" in x:
-            user = self.UTower(**x["user"])
-        if ad is None and "ad" in x:
-            ad = self.AdTower(**x["ad"])
-        if context is None and "context" in x:
-            context = self.CTower(**x["context"])
+        # use cached DLRMTower Embeddings
+        user = cache["user"] if cache is not None and "user" in cache else None
+        ad = cache["ad"] if cache is not None and "ad" in cache else None
+        context = cache["context"] if cache is not None and "context" in cache else None
+
+        if x is not None:
+            # calculate DLRMTower Embeddings if cache is missing
+            if user is None and "user" in x:
+                user = self.UTower(**x["user"])
+            if ad is None and "ad" in x:
+                ad = self.AdTower(**x["ad"])
+            if context is None and "context" in x:
+                context = self.CTower(**x["context"])
         
         combined = list()
         if user is not None:
@@ -579,7 +608,7 @@ class EarlyRanker(nn.Module):
         if context is not None:
             combined.append(context)
         
-        combined = torch.cat(combined, dim=1) # was missing dim=1 -> (B, P_u + P_ad + P_c)
+        combined = torch.cat(combined, dim=1) # (B, P_u + P_ad + P_c)
 
         # Forward shared DNN
         shared_out = self.shared(combined)
@@ -591,3 +620,282 @@ class EarlyRanker(nn.Module):
             task_out.append(self.task_heads[task](shared_out))
         
         return task_out
+    
+
+class FullRanker(nn.Module):
+    """
+    Wraps DLRMTowers + FinalRankerMMoE into a single module compatible with Solver.
+    Towers produce per-tower projections, concatenated and fed into the final ranker.
+    """
+    def __init__(self, towers: dict, final_ranker: FinalRankerMMoE):
+        """
+        Args:
+            towers (dict[str, DLRMTower]): keyed by tower name e.g. {"user": uTower, "ad": adTower}
+            final_ranker (FinalRankerMMoE): pre-initialized final ranker
+        """
+        super().__init__()
+        self.towers = nn.ModuleDict(towers)
+        self.final_ranker = final_ranker
+        # expose these so Solver's sparse MoE loss check works unchanged
+        self.top_k = final_ranker.top_k
+        self.expert_num = final_ranker.expert_num
+
+    @property
+    def importance(self):
+        return self.final_ranker.importance
+
+    @property
+    def load(self):
+        return self.final_ranker.load
+
+    def forward(self, x):
+        """
+        Args:
+            x (dict[str, dict]): keyed by tower name, each value is a dict with:
+                - "dense"       (torch.Tensor | None)
+                - "emb_indices" (dict[str, torch.Tensor])
+                - "emb_offsets" (dict[str, torch.Tensor])
+        Returns:
+            list[torch.Tensor]: T tensors of shape (B, 1), one per task head.
+        """
+        tower_outs = []
+        for name, tower in self.towers.items():
+            tower_outs.append(tower(**x[name]))
+
+        # (B, P_u + P_ad + ...)
+        combined = torch.cat(tower_outs, dim=1)
+        return self.final_ranker(combined)
+
+class Solver:
+    def __init__(self, 
+                 model, 
+                 data,
+                 optimizer,
+                 device, 
+                 epochs, 
+                 checkpoint_dir = "./checkpoints",
+                 checkpoint_every = 1, 
+                 verbose = True, 
+                 print_every = 1, 
+                 reset = False,
+                 importance_weight = 0,
+                 load_weight = 0,
+                 distillation_weights = [],
+                 distillation_tasks = [],
+                 teacher = None
+                ):
+        self.model = model
+        self.data = data
+        self.device = device
+        self.epochs = epochs
+        self.verbose = verbose
+        self.reset = reset
+        self.print_every = print_every
+        self.checkpoint_dir = checkpoint_dir
+        self.checkpoint_every = checkpoint_every  
+        self.optimizer = optimizer
+        self.importance_weight = importance_weight
+        self.load_weight = load_weight
+        self.distillation_weights = distillation_weights
+        self.distillation_tasks = distillation_tasks
+        self.teacher = teacher
+        
+        self.loss_history = []
+        self.loss_history_batch = []
+        self.load_cv_history_batch = []
+        self.importance_cv_history_batch = []
+
+        self.model.to(device)
+    @staticmethod
+    def _build_x(batch):
+        """Construct the structured x dict expected by FullRanker.forward from a flat collated batch dict.
+        Override this method if your tower/feature split differs.
+        Args:
+            batch (dict[str, torch.Tensor]): flat collated batch from AdsDataset._collate_batch.
+        Returns:
+            tuple[dict, list[torch.Tensor]]: x dict for model, list of target tensors per task.
+        """
+        x = {
+            "user": {
+                "dense": None,
+                "emb_indices": {
+                    "uid": batch["uid"],
+                    "last_n_click_campaigns_1D": batch["last_n_click_campaigns_1D"],
+                    "last_n_conversion_campaigns_1D": batch["last_n_conversion_campaigns_1D"],
+                },
+                "emb_offsets": {
+                    "last_n_click_campaigns_1D_offset": batch["last_n_click_campaigns_1D_offset"],
+                    "last_n_conversion_campaigns_1D_offset": batch["last_n_conversion_campaigns_1D_offset"],
+                },
+            },
+            "ad": {
+                "dense": None,
+                "emb_indices": {k: batch[k] for k in ["campaign"] + [f"cat{i}" for i in range(1, 10)]},
+                "emb_offsets": {},
+            },
+        }
+        # one target tensor per task head, shape (B, 1)
+        targets = [
+            batch["click"].float().unsqueeze(1),
+            batch["conversion"].float().unsqueeze(1),
+        ]
+        return x, targets
+
+    def _step(self):
+        total_loss = 0
+        nbatches = len(self.data)
+
+        for counter, batch in enumerate(self.data):
+            # print(f"[{counter}/{nbatches}]")
+
+            # move all tensors in the collated batch dict to device
+            batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
+            x, targets = self._build_x(batch)
+
+            # skips memset to zero op and makes training slightly faster
+            self.optimizer.zero_grad(set_to_none=True)
+
+            # FullRanker.forward(x) -> T x [(B, 1)], one tensor per task
+            task_logits = self.model(x = x)
+
+            # sum BCE loss across all non-distillation task heads
+            loss = sum(
+                nn.functional.binary_cross_entropy_with_logits(
+                    input=task_logits[t],
+                    target=targets[t],
+                    reduction="mean",
+                )
+                for t in range(len(task_logits)-len(self.distillation_tasks))
+            )
+
+            if self.teacher is not None:
+                with torch.no_grad():
+                    teacher_task_logits = self.teacher(x = x)
+                if len(self.distillation_tasks):
+                    if len(self.distillation_weights) == 0:
+                        self.distillation_weights = [1] * len(self.distillation_tasks)
+                    
+                    # strategy 2: meta paper [6] equation 4
+                    # Separate distillation tasks (4 tasks total: CTR, CVR, CTR_distill, CVR_distill)
+                    # distillation_tasks = [2, 3] means task 2 learns from teacher task 0, task 3 from teacher task 1
+
+                    for i, student_task_idx in enumerate(self.distillation_tasks):
+                        # student_task_idx is the task head index in the student model (e.g., 2 or 3)
+                        # i is the corresponding teacher task index (0 or 1)
+                        loss += nn.functional.binary_cross_entropy_with_logits(
+                            input=task_logits[student_task_idx],
+                            target=torch.sigmoid(teacher_task_logits[i]),  # Use i, not student_task_idx
+                            reduction="mean",
+                        ) * self.distillation_weights[i]
+                    
+                else:
+                    if len(self.distillation_weights) == 0:
+                        self.distillation_weights = [1] * len(task_logits)
+                    # strategy 1: distillation paper [13] section 2
+                    # Same tasks with combined hard + soft targets (2 tasks: CTR, CVR)
+                    # Each task learns from BOTH ground truth (already computed above) AND teacher soft targets
+                    
+                    # Add soft target loss for each task (already has hard target loss from earlier)
+                    for t in range(len(task_logits)):
+                        loss += nn.functional.binary_cross_entropy_with_logits(
+                            input=task_logits[t],
+                            target=torch.sigmoid(teacher_task_logits[t]),
+                            reduction="mean",
+                        ) * self.distillation_weights[t]
+
+
+            # sparse MoE auxiliary losses (importance + load), only when sparsity is active
+            is_sparse = hasattr(self.model, "top_k") and hasattr(self.model, "expert_num") \
+                        and self.model.top_k and self.model.top_k < self.model.expert_num
+            if is_sparse:
+                # self.model.importance: L x [I x (E,)]
+                # CV is computed per gate (per layer, per expert group) so each gate is independently
+                # pushed toward uniform expert utilization. Aggregating across layers before std/mean
+                # would conflate gates operating at different scales with independent routing behaviors.
+                # Sparse MoE paper [3] equation 7
+                importance_loss = torch.tensor(0.0, device=self.device)
+                importance_cv_sum = 0.0
+                n_gates = 0
+                for layer in self.model.importance:
+                    for gate_importance in layer:  # gate_importance: (E,)
+                        std, mean = torch.std_mean(gate_importance)
+                        cv = std / (mean + 1e-9)
+                        importance_loss = importance_loss + cv ** 2
+                        importance_cv_sum += float(cv.item())
+                        n_gates += 1
+                importance_loss = self.importance_weight * importance_loss
+
+                # Sparse MoE paper [3] equation 11
+                load_loss = torch.tensor(0.0, device=self.device)
+                load_cv_sum = 0.0
+                for layer in self.model.load:
+                    for gate_load in layer:  # gate_load: (E,)
+                        std, mean = torch.std_mean(gate_load)
+                        cv = std / (mean + 1e-9)
+                        load_loss = load_loss + cv ** 2
+                        load_cv_sum += float(cv.item())
+                load_loss = self.load_weight * load_loss
+
+                loss = loss + importance_loss + load_loss
+
+                # track mean CV across gates — should decrease as routing becomes more balanced
+                self.importance_cv_history_batch.append(importance_cv_sum / max(n_gates, 1))
+                self.load_cv_history_batch.append(load_cv_sum / max(n_gates, 1))
+
+            loss.backward()
+            self.optimizer.step()
+
+            total_loss += float(loss.item())
+            self.loss_history_batch.append(float(loss.item()))
+
+        return total_loss / nbatches
+
+    
+    def _save(self, loss, epoch, filepath):
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        checkpoint = {
+            "epoch" : epoch,
+            "loss" : loss,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict()
+        }
+        torch.save(checkpoint, filepath)
+        print(f"Checkpoint saved at {filepath}")
+
+    def _load(self, filepath):
+        if not os.path.exists(filepath):
+            return None, None
+        checkpoint = torch.load(filepath, map_location=self.device)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        epoch = checkpoint["epoch"]
+        loss = checkpoint["loss"]
+        return epoch, loss
+    
+    def train(self):
+        start_epoch = 0
+        if not self.reset:
+            saved_epoch, saved_loss = self._load(os.path.join(self.checkpoint_dir, "last_checkpoint.pth"))
+
+            # if loading a saved epoch, then continue from the last epoch
+            if saved_epoch is not None:
+                self.loss_history.append(saved_loss)
+                print(f"Load [{saved_epoch}/{self.epochs}] Loss {self.loss_history[-1]:.6f}")
+                start_epoch = saved_epoch + 1
+
+        # Set the model to training mode
+        self.model.train()
+
+        for epoch in range(start_epoch, self.epochs):
+            epoch_start_time = time.time()
+            epoch_loss = self._step()
+            epoch_end_time = time.time()
+            
+            if self.verbose and epoch % self.print_every == 0:
+                print(f"[{epoch}/{self.epochs}] Loss: {epoch_loss:.6f} time: {(epoch_end_time - epoch_start_time) / 60.0}m")
+            if epoch % self.checkpoint_every == 0:
+                self._save(loss = epoch_loss, epoch = epoch, filepath = os.path.join(self.checkpoint_dir, f"checkpoint_epoch_{epoch}.pth"))
+                self._save(loss = epoch_loss, epoch = epoch, filepath = os.path.join(self.checkpoint_dir, f"last_checkpoint.pth"))
+            
+            self.loss_history.append(epoch_loss)
