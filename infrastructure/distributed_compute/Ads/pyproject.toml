@@ -1,0 +1,13 @@
+[project]
+name = "ads"
+version = "0.1.0"
+description = "Distributed Training on Criteo Ads Dataset"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "boto3>=1.42.62",
+    "datasets>=4.6.1",
+    "ray[data,default,train]>=2.54.0",
+    "s3torchconnector>=1.5.0",
+    "torch>=2.10.0",
+]
