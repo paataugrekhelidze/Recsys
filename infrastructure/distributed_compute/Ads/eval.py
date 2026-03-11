@@ -103,7 +103,7 @@ class TorchPredictor:
 
 # creates a dataset plan (lazy)
 # during execution, Reader tasks start producing blocks on nodes A (whatever matches the selector, e.g. worker nodes)
-data_path = "s3://<BUCKET-NAME>/criteo/train.parquet"
+data_path = "s3://<BUCKET-NAME>/criteo/val.parquet"
 ds = ray.data.read_parquet(data_path, 
                            ray_remote_args={
                                 "label_selector": {
@@ -115,7 +115,7 @@ ds = ray.data.read_parquet(data_path,
 predictions = ds.map_batches(
     TorchPredictor,
     fn_constructor_kwargs={
-        "s3_path": "<BUCKET-NAME>/ads/earlyRanker/ray_train_run-2026-03-10_05-40-46/checkpoint_2026-03-10_06-23-47.384914/model.pt",
+        "s3_path": "<BUCKET-NAME>/ads/earlyRanker/ray_train_run-2026-03-11_05-36-31/checkpoint_2026-03-11_06-27-25.881891/model.pt",
         "region": "us-west-2",
         "device": "cpu",
         "user_v": int(2e6),
