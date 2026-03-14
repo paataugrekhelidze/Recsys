@@ -9,6 +9,7 @@ dependencies = [
     "ipykernel>=7.1.0",
     "matplotlib>=3.10.8",
     "polars>=1.37.1",
+    "s3fs>=2025.10.0",
     "scikit-learn>=1.8.0",
     "torch>=2.10.0",
 ]
