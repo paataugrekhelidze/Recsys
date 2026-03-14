@@ -92,12 +92,11 @@ class AdsDataset(torch.utils.data.Dataset):
     
 class FinalRankerMMoE(nn.Module):
     """
-    Multi-layer Multi-task multi-gate mixture of experts (ML-MMoE), similar to Youtube paper [3]. Defaults to MMoE if layers = 1
+    Multi-task multi-gate mixture of experts, similar to Youtube paper [3].
     Input data is transformed using a two-tower DLRM approach described in Meta paper [6].
     """
-    def __init__(self, input_size = None, layers = 1, expert_num = 10, expert_dims = [512, 512], gate_dims = [], gate_dropout = None, task_dims = [[512, 256], [512, 256]], top_k = 3):
+    def __init__(self, input_size = None, expert_num = 10, expert_dims = [512, 512], gate_dims = [], gate_dropout = None, task_dims = [[512, 256, 1], [512, 256, 1]], top_k = 3):
         super().__init__()
-        self.layers = layers
         self.expert_num = expert_num
         self.task_dims = task_dims
         self.expert_dims = expert_dims
@@ -107,13 +106,10 @@ class FinalRankerMMoE(nn.Module):
         # initialize values for importance and load losses
         self.importance = None
         self.load = None
-        
-        # initialize standard normal dist, used to calculate probability for load loss
-        self.std_normal = torch.distributions.Normal(loc=0., scale=1.)
 
-        # initialize experts for each layer and gates (1 for each task and layer)
-        self.experts = self.init_experts(input_size = input_size, layers = layers, expert_num = expert_num, expert_dims = expert_dims)
-        self.gates, self.noises = self.init_gates(input_size = input_size, layers = layers, task_num = len(task_dims), gate_dims = gate_dims, expert_num = expert_num, expert_dims = expert_dims)
+        # initialize experts and task gates (1 for each task)
+        self.experts = self.init_experts(input_size = input_size, expert_num = expert_num, expert_dims = expert_dims)
+        self.gates, self.noises = self.init_gates(input_size = input_size, task_num = len(task_dims), gate_dims = gate_dims, expert_num = expert_num, expert_dims = expert_dims)
         self.task_heads = self.init_heads(expert_dims = expert_dims, task_dims = task_dims)
 
         # initialize weights
@@ -125,35 +121,25 @@ class FinalRankerMMoE(nn.Module):
 
 
 
-    def init_experts(self, input_size, layers, expert_num, expert_dims):
-        # l elements, each representing a layer
+    def init_experts(self, input_size, expert_num, expert_dims):
         # within each layer element, multiple experts for the layer
         # each expert is just MLP, dimensions defined by expert_dims
 
         # Note: for each layer, do not include activations at the end of MLP
-        # makes sense to do on MLPs belonging to the last layer, but why apply the same rule to the intermediate layers
-        # more expressive power to the weighted sum???
-        experts = nn.ModuleList() # L x [ E x [MLP]]
-        for l in range(layers):
-            layer_experts = nn.ModuleList() # experts for layer l
-            for _ in range(expert_num):
-                # Define MLP
-                expert = nn.ModuleList()
-                for d in range(len(expert_dims)):
-                    if d == 0:
-                        if l == 0:
-                            expert.append(nn.Linear(in_features=input_size, out_features=expert_dims[d], bias=True))
-                        else:
-                            # last dimension of the previous layer's expert should be the input dimension of next layer's expert
-                            expert.append(nn.Linear(in_features=expert_dims[-1], out_features=expert_dims[d], bias=True))
-                    else:
-                        expert.append(nn.Linear(in_features=expert_dims[d-1], out_features=expert_dims[d], bias=True))
+        experts = nn.ModuleList() # E x [MLP]
+        for _ in range(expert_num):
+            # Define MLP
+            expert = nn.ModuleList()
+            for d in range(len(expert_dims)):
+                if d == 0:
+                    expert.append(nn.Linear(in_features=input_size, out_features=expert_dims[d], bias=True))
+                else:
+                    expert.append(nn.Linear(in_features=expert_dims[d-1], out_features=expert_dims[d], bias=True))
 
-                    # add activation if not last layer of the MLP
-                    if d < len(expert_dims)-1:
-                        expert.append(nn.ReLU())
-                layer_experts.append(nn.Sequential(*expert))
-            experts.append(layer_experts)
+                # add activation if not last layer of the MLP
+                if d < len(expert_dims)-1:
+                    expert.append(nn.ReLU())
+            experts.append(nn.Sequential(*expert))
 
         return experts
 
@@ -174,8 +160,8 @@ class FinalRankerMMoE(nn.Module):
         return task_heads
     
 
-    def init_gates(self, input_size, layers, task_num, gate_dims, expert_num, expert_dims):
-        # for each layer l, create h gates, one for each expert or task in next layer
+    def init_gates(self, input_size, task_num, gate_dims, expert_num, expert_dims):
+        # create h gates, one for each task
         gates = nn.ModuleList()
         
         # noise per gate, if sparse MoE is implemented. Necessary to implement balanced traffic load across experts
@@ -184,57 +170,36 @@ class FinalRankerMMoE(nn.Module):
         # extra complexity but necessary to force the gates to distribute top_k "equally" across experts
         
         noises = nn.ModuleList()
-        for l in range(layers):
-            # h gates for a specific layer l, each corresponding to a task
-            layer_gates = nn.ModuleList()
-            layer_noises = nn.ModuleList()
-            NUM_GATES = task_num if l == layers-1 else expert_num
-            for _ in range(NUM_GATES):
-                gate = nn.ModuleList()
-                for d in range(len(gate_dims)):
-                    if d == 0:
-                        # define whether gate takes input from the input data or the previous expert layer
-                        if l == 0:
-                            gate.append(nn.Linear(in_features=input_size, out_features=gate_dims[d], bias=False))
-                        else:
-                            gate.append(nn.Linear(in_features=expert_dims[-1], out_features=gate_dims[d], bias=False))
-                    else:
-                        gate.append(nn.Linear(in_features=gate_dims[d-1], out_features=gate_dims[d], bias=False))
-                    
-                    if d < len(gate_dims)-1:
-                        gate.append(nn.ReLU())
-
-                # final projection layer to num_experts
-                if l == 0:
-                    gate.append(nn.Linear(in_features=input_size if len(gate_dims) == 0 else gate_dims[-1], out_features=expert_num, bias=False))
-                else:
-                    gate.append(nn.Linear(in_features=expert_dims[-1] if len(gate_dims) == 0 else gate_dims[-1], out_features=expert_num, bias=False))
-                layer_gates.append(nn.Sequential(*gate))
-
-                # define noise weights
-                # for simplicity I am just making it a single learnable layer
-                # within a layer, there are as many gates as # of heads
-                if l == 0:
-                    noise = nn.Linear(in_features=input_size, out_features=expert_num, bias=False)
-                else:
-                    noise = nn.Linear(in_features=expert_dims[-1], out_features=expert_num, bias=False)
-                layer_noises.append(noise)
-
-            gates.append(layer_gates)
-            noises.append(layer_noises)
         
+        NUM_GATES = task_num
+        for _ in range(NUM_GATES):
+            gate = nn.ModuleList()
+            for d in range(len(gate_dims)):
+                if d == 0:
+                    # define whether gate takes input from the input data or the previous expert layer
+                    gate.append(nn.Linear(in_features=input_size, out_features=gate_dims[d], bias=False))
+                else:
+                    gate.append(nn.Linear(in_features=gate_dims[d-1], out_features=gate_dims[d], bias=False))
+                
+                if d < len(gate_dims)-1:
+                    gate.append(nn.ReLU())
+
+            # final projection layer to num_experts
+            gate.append(nn.Linear(in_features=input_size if len(gate_dims) == 0 else gate_dims[-1], out_features=expert_num, bias=False))
+            gates.append(nn.Sequential(*gate))
+
+            # define noise weights
+            # for simplicity I am just making a noise parameter a single learnable vector
+            noise = nn.Linear(in_features=input_size, out_features=expert_num, bias=False)
+            noises.append(noise)
     
         return gates, noises
 
     
-    def gate_forward(self, x, layer):
-        device = next(self.parameters()).device
+    def gate_forward(self, x):
+        # gate input is just a raw input x
         
-        # gate input is raw input at layer 0 OR weighted sum output of the associated gate in the previous layer. PLE paper [10] equation 6
-        
-        # (B, D) or I x [(B, E)] -> I x [(B, E)] where B is batch, D is input_dim or last dim of last layers' expert, I separate gates (each for separate experts in next layer), E is a number of experts that goes in the input
-
-
+        # (B, D) -> I x [(B, E)] where B is batch, D is input_dim, I separate gates for each task, E is a number of experts that goes in softmax
 
         # 3 separate strategies to balance expert utilization: importance loss, load loss (if sparse MoE), and gate dropout
         # importance loss tries to minimize variance of sum of softmax scores across experts per batch, so given a batch, if we add up scores from the gate softmax, total sum of weights across experts in a batch is forced to be similar
@@ -244,39 +209,38 @@ class FinalRankerMMoE(nn.Module):
         # list output for each task
         out = list() # I x [(B, E)]
         e_prob = list() # expert probabilities that their output (expected + variance) is > top_k across other experts
-        NUM_GATES = self.expert_num if layer < self.layers-1 else len(self.task_dims)
+        runtime_device = x.device
+        NUM_GATES = len(self.task_dims)
         for i in range(NUM_GATES):
             # Sparse MoE paper [1] equations 3, 4, 5
-            mean = self.gates[layer][i](x) if layer == 0 else self.gates[layer][i](x[i]) # PLE paper [10] equation 6, progressive routing
-            # (B, E)
-            H_l = mean
+            mean = self.gates[i](x)
+            routing_logits = mean
             # introduce noise only if sparsity is enabled
             # this technique is used only to balance # of times each expert is picked in top_k
             if self.top_k and self.top_k < self.expert_num:
-                std = nn.functional.softplus(self.noises[layer][i](x))
+                std = nn.functional.softplus(self.noises[i](x))
+                noisy_logits = mean + torch.randn_like(input=std, device=runtime_device) * std
+
+                top_values, _ = torch.topk(noisy_logits, k=self.top_k + 1, dim=1)
+                k_largest = top_values[:, self.top_k-1].unsqueeze(-1) # (B, 1)
+                k_next_largest = top_values[:, self.top_k].unsqueeze(-1) # (B, 1)
+
                 # sampling from N(mean, std^2) represented as: mean + N(0, I)*std, where N(0, I) is a random sample from standard dist
-                H_l += torch.randn_like(input=std, device=device) * std
-            
                 # keep only top_k
-                k_largest, _ = torch.kthvalue(-H_l, self.top_k, dim=1)
-                k_largest = -k_largest.unsqueeze(-1) # (B, 1)
                 # will be set to 0 when normalized in softmax
                 # (B, E)
-                H_l[H_l < k_largest] = -float("inf")
+                routing_logits = noisy_logits.masked_fill(noisy_logits < k_largest, -float("inf"))
 
 
                 # Sparse MoE paper [1] equations 8, 9
                 # Goal of these equations is to define a load loss.
                 # It tries to minimize variation between the sum of probabilities that the output is > top_k across experts
-                # compute probability that H_l > top_k
+                # compute probability that H > top_k
                 
                 # needed to implement kth_excluding
                 # threshold is defined as > kth_greatest, unless the expert is the kth_greatest, then threshold is moved to k+1th greatest
-                k_next_largest, _ = torch.kthvalue(-H_l, self.top_k+1, dim=1)
-                k_next_largest = -k_next_largest.unsqueeze(-1)
-
                 # (B, E) - True where expert would be exactly kth
-                is_kth_expert = (H_l == k_largest)
+                is_kth_expert = (noisy_logits == k_largest)
                 # (B, E) - threshold excluding each expert
                 threshold_excluding = torch.where(is_kth_expert, k_next_largest, k_largest)
                 
@@ -289,13 +253,18 @@ class FinalRankerMMoE(nn.Module):
                 # z = (threshold - μ) / σ
                 z_score = (threshold_excluding - mean) / (std + 1e-9) # (B, E)
                 # use precomputed cdf of standard normal
+                # initialize standard normal dist, used to calculate probability for load loss
+                std_normal = torch.distributions.Normal(
+                    loc=torch.zeros((), device=z_score.device, dtype=z_score.dtype),
+                    scale=torch.ones((), device=z_score.device, dtype=z_score.dtype),
+                )
                 # (B, E)
-                i_prob = self.std_normal.cdf(-z_score) # Φ(-z)
+                i_prob = std_normal.cdf(-z_score) # Φ(-z)
                 # I x [(B, E)]
                 e_prob.append(i_prob)
 
             # (B, E)
-            softmax = nn.functional.softmax(H_l, dim=1)
+            softmax = nn.functional.softmax(routing_logits, dim=1)
             # make sure this dropout is only applied during training, not during inference
             if self.training and self.gate_dropout:
                 # Youtube paper [3] section 5.2.4 - Used to break expert polarization
@@ -311,62 +280,48 @@ class FinalRankerMMoE(nn.Module):
         return out, e_prob
     
     def moe_forward(self, x):
-        # ML-MMOE implementation, default to MMOE if layers = 1
-        # (B, D) -> I x [(B, E)]
+        # MMoE implementation
+        # (B, D) -> I x [(B, F)] where B is batch, D is input_dim, I separate outputs for each task, F is the last dimension of the experts
 
-        # iterate through each layer
-        # within each layer, run gates for separate tasks
-        # for each task, calculate weighted sum of experts in each layer
+        # run gates for separate tasks
+        # for each task, calculate weighted sum of experts
         # record sum of gate scores across batch for importance loss
         # record sum of gate probabilites of > kth_greatest across batch for load loss
 
+        # importance and load variables
         importance = list()
         load = list()
 
-        x_l = x # input at layer l
-        for l in range(self.layers):
-            # initialize layer specific importance and load variables
-            layer_importance = list() # I x [importance_l_i]
-            layer_load = list()
+        runtime_device = x.device
 
-            # initialize zeros for the weighted sum across experts for a given layer
-            # I x [(B, M)] where M is the dimesion of the expert output vector, defined for I independent gates
-            NUM_GATES = self.expert_num if l < self.layers-1 else len(self.task_dims)
-            layer_gate_out = [torch.zeros((x.shape[0], self.expert_dims[-1]))] * NUM_GATES
+        # initialize zeros for the weighted sum across experts
+        # I x [(B, M)] where M is the dimesion of the expert output vector, defined for I independent gates
+        NUM_GATES = len(self.task_dims)
+        gate_out = [torch.zeros((x.shape[0], self.expert_dims[-1]), device=runtime_device) for _ in range(NUM_GATES)]
 
-            g, gate_probs = self.gate_forward(x=x_l, layer=l) # outputs for all I gates at layer l
-            for i in range(NUM_GATES):
-                # calculate weighted sum from the ith gate
+        g, gate_probs = self.gate_forward(x=x) # outputs for all I gates
+        # (B, E, F) B batch, E # of experts, F last dimension of each expert
+        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=1)
+        for i in range(NUM_GATES):
+            # calculate weighted sum from the ith gate
 
-                # Youtube paper [3] equation 1
-                # f(x) = sum(g_e(x) * f_e(x)) where e is the eth expert
-                for e in range(self.expert_num):
-                    # expert input is raw input at layer 0 OR weighted sum output of the associated gate in the previous layer. PLE paper [10] equation 6
-                    # (B, M) is the M dimenional output of the eth expert across B batches
-                    f_e = self.experts[l][e](x_l) if l == 0 else self.experts[l][e](x_l[e])
-                    # (B, 1) * (B, M)
-                    # (B, 1) are weights from the gate for eth expert across B batches
-                    layer_gate_out[i] += g[i][:, e].unsqueeze(-1) * f_e
-                
-                # (B, E) -> (1, E) sum of gate score for each expert, summed by batch dimension
-                importance_l_i = torch.sum(g[i], dim=0) # ith gate at layer l
-                layer_importance.append(importance_l_i)
+            # Youtube paper [3] equation 1
+            # f(x) = sum(g_e(x) * f_e(x)) where e is the eth expert
+            # sum((B, E, 1) * (B, E, F), dim=1) -> (B, F), where (B, E, 1) are scalar weights for E experts on B samples. (B, E, F) is F dimensional output for E experts on B samples.
+            gate_out[i] = torch.sum(g[i].unsqueeze(-1) * expert_outputs, dim=1)
+            
+            # (B, E) -> (1, E) sum of gate score for each expert, summed by batch dimension
+            importance.append(torch.sum(g[i], dim=0)) # ith gate
 
-                # if sparsity is enabled, calculate load value for load loss
-                if self.top_k and self.top_k < self.expert_num:
-                    # (B, E) -> (1, E) sum of gate probabilities for each expert score being > top_k, summed by batch dimension
-                    load_l_i = torch.sum(gate_probs[i], dim=0)
-                    layer_load.append(load_l_i)
-
-            importance.append(layer_importance)
             # if sparsity is enabled, calculate load value for load loss
             if self.top_k and self.top_k < self.expert_num:
-                load.append(layer_load)
+                # (B, E) -> (1, E) sum of gate probabilities for each expert score being > top_k, summed by batch dimension
+                load.append(torch.sum(gate_probs[i], dim=0))
 
-            # .... must figure out x_l for next layer, if next layer experts get weighted sum of previous experts weighted by a unique gate, then what should the next layer gate network take as input???
-            x_l = layer_gate_out
 
-        return x_l, importance, load
+        x = gate_out
+
+        return x, importance, load
     
     def task_forward(self, x):
         # I x [(B, D)] -> I x [(B, O)] - O dimensional output, for I separate tasks across B samples
@@ -382,7 +337,7 @@ class FinalRankerMMoE(nn.Module):
         # (B, D) -> (B, T) where D is the input dimension, and T is the number of tasks
 
         # importance and load losses are per layer per task (basically 1 for each gate)
-        self.importance = list() # L x [ I x [importance_l_i]] where L is layer, I is # of gates at layer l (equal to # of tasks at the last layer, otherwise # of experts in next layer), importance_l_i is importance of ith gate at layer l 
+        self.importance = list() # I x [importance_i] where I is # of gates (equal to # of tasks), importance_i is importance of ith gate
         self.load = list()
 
         expert_out, importance, load = self.moe_forward(x)
@@ -798,7 +753,7 @@ class Solver:
 
             if self.teacher is not None:
                 with torch.no_grad():
-                    teacher_task_logits = self.teacher(x)
+                    teacher_task_logits = self.teacher(x = x)
                 if len(self.distillation_tasks):
                     if len(self.distillation_weights) == 0:
                         self.distillation_weights = [1] * len(self.distillation_tasks)
@@ -845,31 +800,26 @@ class Solver:
                 importance_loss = torch.tensor(0.0, device=self.device)
                 importance_cv_sum = 0.0
                 n_gates = 0
-                for layer in underlying.importance:
-                    for gate_importance in layer:  # gate_importance: (E,)
-                        std, mean = torch.std_mean(gate_importance)
-                        cv = std / (mean + 1e-9)
-                        importance_loss = importance_loss + cv ** 2
-                        importance_cv_sum += float(cv.item())
-                        n_gates += 1
+                for gate_importance in underlying.importance:  # gate_importance: (E,)
+                    std, mean = torch.std_mean(gate_importance)
+                    cv = std / (mean + 1e-9)
+                    importance_loss = importance_loss + cv ** 2
+                    importance_cv_sum += float(cv.item())
+                    n_gates += 1
                 importance_loss = self.importance_weight * importance_loss
 
                 # Sparse MoE paper [3] equation 11
                 load_loss = torch.tensor(0.0, device=self.device)
                 load_cv_sum = 0.0
-                for layer in underlying.load:
-                    for gate_load in layer:  # gate_load: (E,)
-                        std, mean = torch.std_mean(gate_load)
-                        cv = std / (mean + 1e-9)
-                        load_loss = load_loss + cv ** 2
-                        load_cv_sum += float(cv.item())
+                for gate_load in underlying.load:  # gate_load: (E,)
+                    std, mean = torch.std_mean(gate_load)
+                    cv = std / (mean + 1e-9)
+                    load_loss = load_loss + cv ** 2
+                    load_cv_sum += float(cv.item())
                 load_loss = self.load_weight * load_loss
 
                 loss = loss + importance_loss + load_loss
 
-                # track mean CV across gates — should decrease as routing becomes more balanced
-                # self.importance_cv_history_batch.append(importance_cv_sum / max(n_gates, 1))
-                # self.load_cv_history_batch.append(load_cv_sum / max(n_gates, 1))
 
             loss.backward()
             self.optimizer.step()
@@ -902,16 +852,7 @@ class Solver:
         return epoch, loss
     
     def train(self):
-        # start_epoch = 0
-        # if not self.reset:
-        #     saved_epoch, saved_loss = self._load(os.path.join(self.checkpoint_dir, "last_checkpoint.pth"))
-
-        #     # if loading a saved epoch, then continue from the last epoch
-        #     if saved_epoch is not None:
-        #         self.loss_history.append(saved_loss)
-        #         print(f"Load [{saved_epoch}/{self.epochs}] Loss {self.loss_history[-1]:.6f}")
-        #         start_epoch = saved_epoch + 1
-
+        
         # Set the student model to training mode
         self.model.train()
         if self.teacher is not None:
@@ -927,9 +868,7 @@ class Solver:
             
             if self.verbose and epoch % self.print_every == 0:
                 print(f"[{epoch}/{self.epochs}] Loss: {loss:.6f} time: {(epoch_end_time - epoch_start_time) / 60.0}m")
-            # if epoch % self.checkpoint_every == 0:
-            #     self._save(loss = epoch_loss, epoch = epoch, filepath = os.path.join(self.checkpoint_dir, f"checkpoint_epoch_{epoch}.pth"))
-            #     self._save(loss = epoch_loss, epoch = epoch, filepath = os.path.join(self.checkpoint_dir, f"last_checkpoint.pth"))
+            
             metrics = {"loss": loss, "epoch": epoch}
             with tempfile.TemporaryDirectory() as temp_checkpoint_dir:
                 checkpoint = None

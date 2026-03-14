@@ -271,7 +271,7 @@ trainer = TorchTrainer(
     scaling_config=ScalingConfig( num_workers=num_workers, 
                                  use_gpu=use_gpu,
                                  # resources_per_worker={"CPU": 5}, # this is simply for scheduling and reserving cores, not an OS cap on the process
-                                 label_selector={"worker-label":"True"}, # only schedule trainer actors on worker nodes
+                                 #label_selector={"worker-label":"True"}, # dont use the custom label here, apparently it is not visible when autoscaling decision is made
                                  resources_per_worker={"worker-resource": 1}, # each worker node has a capacity of 1, so 1 trainer for each worker node
                                 ),
     run_config=RunConfig(

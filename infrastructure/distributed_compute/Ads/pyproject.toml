@@ -9,5 +9,6 @@ dependencies = [
     "datasets>=4.6.1",
     "ray[data,default,train]>=2.54.0",
     "s3torchconnector>=1.5.0",
+    "starlette>=0.52.1",
     "torch>=2.10.0",
 ]
