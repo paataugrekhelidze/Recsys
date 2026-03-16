@@ -1,0 +1,121 @@
+apiVersion: ray.io/v1
+kind: RayService
+metadata:
+  name: ads-ranker
+spec:
+  # Replaces: serve run --runtime-env-json '{"env_vars": {...}}' serve_mmoe:app
+  serveConfigV2: |
+    applications:
+      - name: app1
+        route_prefix: /
+        import_path: serve_mmoe:app
+        runtime_env:
+          working_dir: "s3://<BUCKET-NAME>/ads/serve_code/serve_code.zip"
+          pip: ["torch", "boto3", "datasets"]
+          env_vars:
+            ADS_CHECKPOINT_PATH: "s3://<BUCKET-NAME>/ads/finalRanker/split"
+            AWS_REGION: "us-west-2"
+        deployments:
+        - name: ExpertShard
+          num_replicas: 4
+          max_ongoing_requests: 512
+          ray_actor_options:
+            num_cpus: 1.0
+            resources:
+              expert-resource: 1
+          max_replicas_per_node: 1
+        - name: Ranker
+          num_replicas: 5
+          max_ongoing_requests: 32
+          ray_actor_options:
+            num_cpus: 0.5
+            resources:
+              shared-resource: 0.2
+
+  rayClusterConfig:
+    rayVersion: '2.54.0'
+    enableInTreeAutoscaling: true   # must be enabled to allow pod replica scaling. When enabled, KubeRay operator automatically configures an autoscaling sidecar container for the Ray head Pod.
+    autoscalerOptions:
+      upscalingMode: Default
+      idleTimeoutSeconds: 60
+
+    # Replaces: ray.head.default (m5.large)
+    headGroupSpec:
+      rayStartParams:
+        dashboard-host: "0.0.0.0"
+        num-cpus: "0"        # head is control-plane only
+      template:
+        spec:
+          serviceAccountName: ray-s3-sa  # replaces IamInstanceProfile
+          # force head pod to go to a node with the following label
+          # Pin head to head node group
+          nodeSelector:
+            role: ray-head
+          # Must tolerate the taint we put on the head node group
+          # even if the pod wants to be schedule on a head node, it needs a following toleration to be allowed
+          # an actual physical node has a node-taint to prevent other pods to be schedule on the ndoe
+          tolerations:
+            - key: role
+              value: ray-head
+              operator: Equal
+              effect: NoSchedule
+          containers:
+            - name: ray-head
+              image: rayproject/ray:2.54.0-py312
+              resources:
+                requests: { cpu: "1", memory: "3Gi" }
+                limits:   { cpu: "2", memory: "4Gi" }
+
+    workerGroupSpecs:
+      # Replaces: ray.worker.expert (m5.xlarge, resources: {"expert-resource": 1})
+      - groupName: expert-workers
+        replicas: 1
+        minReplicas: 1
+        maxReplicas: 4 # autoscaler can scale up to 4 pods, since each expert pod is forced to run on a unique node, every time a new pod is added, it will consume a new physical machine
+        rayStartParams:
+          # budget of the custom resource on each expert worker pod. expert replicas each consume 1 unit, so only 1 replica on each expert pod -> 1 replica on a single physical machine
+          resources: '"{\"expert-resource\": 1}"'
+        template:
+          spec:
+            affinity:
+              podAntiAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  - labelSelector:
+                      matchLabels:
+                        ray.io/group: expert-workers   # KubeRay sets this label automatically
+                    topologyKey: kubernetes.io/hostname  # forces to only schedule a single instance of expert-worker pod per K8s node (1 K8s node = 1 Ray pod)
+            serviceAccountName: ray-s3-sa
+            nodeSelector:
+              # expert pods are scheduled on nodes labeled with role: ray-expert-worker
+              role: ray-expert-worker
+            containers:
+              - name: ray-worker
+                image: rayproject/ray:2.54.0-py312
+                resources:
+                  requests: { cpu: "2", memory: "8Gi" }
+                  # alternative way to force a single pod on an m5.xlarge instance
+                  # requests: { cpu: "4", memory: "16Gi" }
+
+      # Replaces: ray.worker.default (m5.xlarge, resources: {"shared-resource": 1})
+      - groupName: shared-workers
+        replicas: 1
+        minReplicas: 1
+        maxReplicas: 3
+        rayStartParams:
+          #https://docs.ray.io/en/latest/cluster/kubernetes/user-guides/config.html#id1
+          # budget of the custom resource on each shared worker pod. shared replicas each consume 0.2 unit, that means a single pod can host 5 replicas
+          # but, if 5 replicas are requested, each replica requiring 0.5 cpu (total budget is 2 on a pod), an additional shared worker pod will be spawned, possibly within the same machine.
+          # as a result, a single physical machine (4 CPU and 16 memory on m5.xlarge) will host two shared work pods, one running 4 replicas and another running only 1
+          resources: '"{\"shared-resource\": 1}"'
+        template:
+          spec:
+            serviceAccountName: ray-s3-sa
+            nodeSelector:
+              # shared pods are scheduled on nodes labeled with role: ray-shared-worker
+              role: ray-shared-worker
+            containers:
+              - name: ray-worker
+                image: rayproject/ray:2.54.0-py312
+                resources:
+                  # budget on each worker pod
+                  requests: { cpu: "2", memory: "6Gi" }

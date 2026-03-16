@@ -90,6 +90,41 @@ class AdsDataset(torch.utils.data.Dataset):
                 
         return batched
     
+    @staticmethod
+    def _local_collate_batch(batch, user_v, campaign_v):
+        batched = {}
+        for key in batch[0].keys():
+            if key in ["last_n_click_campaigns", "last_n_conversion_campaigns"]:
+                action_list, action_offsets = [], [0]
+                for sample in batch:
+                    actions = sample[key]
+
+                    if not actions:
+                        # represents a missing campaign embedding, let the model learn what the value should represent
+                        # some users may not have any recent clicks or conversions, so their embedding will be represented with a learnable null vector
+                        # unknown ids naturally mapped to a controllable hash space, which also helps with the cold-start problem
+                        # alternatively, locality based hashing can be implemented to better deal with cold-start problem, e.g. same hash for ads with similar attributes (same advertiser, topic, marketing type...)
+                        # NOTE: campaign_v is used as the reserved null index; embedding table must have size campaign_v + 1
+                        processed_actions = torch.tensor([campaign_v], dtype=torch.int64)
+                    else:
+                        # hash real campaign ids into [0, campaign_v - 1], keeping campaign_v free for the null sentinel
+                        processed_actions = torch.as_tensor(actions, dtype=torch.int64) % campaign_v
+                    
+                    action_list.append(processed_actions)
+                    action_offsets.append(len(processed_actions))
+                # click and conversion list represented as 1D; real ids in [0, campaign_v-1], null sentinel at campaign_v
+                batched[key+"_1D"] = torch.cat(action_list)
+                batched[key+"_1D_offset"] = torch.tensor(action_offsets[:-1]).cumsum(dim=0) # tensor([13,  7,  3, 10, 13,  3, 15, 10,  9, 10]) -> tensor([13, 20, 23, 33, 46, 49, 64, 74, 83, 93])
+            elif key == "uid":
+                batched[key] = torch.stack([sample[key] % user_v for sample in batch])
+            elif key == "campaign":
+                batched[key] = torch.stack([sample[key] % campaign_v for sample in batch])
+            else:
+                # stack other labels as usual
+                batched[key] = torch.stack([sample[key] for sample in batch])
+        
+        return batched
+    
 class FinalRankerMMoE(nn.Module):
     """
     Multi-task multi-gate mixture of experts, similar to Youtube paper [3].
@@ -334,7 +369,7 @@ class FinalRankerMMoE(nn.Module):
 
 
     def forward(self, x):
-        # (B, D) -> (B, T) where D is the input dimension, and T is the number of tasks
+        # (B, D) -> I x [(B, 1)] where D is the input dimension, and I is the number of tasks
 
         # importance and load losses are per layer per task (basically 1 for each gate)
         self.importance = list() # I x [importance_i] where I is # of gates (equal to # of tasks), importance_i is importance of ith gate
@@ -351,6 +386,265 @@ class FinalRankerMMoE(nn.Module):
         
                 
         return task_out
+
+
+class MultiplexedFinalRankerMMoE(FinalRankerMMoE):
+    """
+    MMoE variant for multiplexed serving.
+
+    The class keeps routing layers and task heads local, but can avoid loading all
+    experts into the same process. It exposes a routing plan, expert input packing,
+    and reduction utilities so expert execution can happen in external Ray Serve
+    deployments keyed by expert id.
+    """
+    def __init__(
+        self,
+        input_size=None,
+        expert_num=10,
+        expert_dims=[512, 512],
+        gate_dims=[],
+        gate_dropout=None,
+        task_dims=[[512, 256, 1], [512, 256, 1]],
+        top_k=3,
+        load_local_experts=False,
+    ):
+        self.load_local_experts = load_local_experts
+        self.input_size = input_size
+        super().__init__(
+            input_size=input_size,
+            expert_num=expert_num,
+            expert_dims=expert_dims,
+            gate_dims=gate_dims,
+            gate_dropout=gate_dropout,
+            task_dims=task_dims,
+            top_k=top_k,
+        )
+
+    def init_experts(self, input_size, expert_num, expert_dims):
+        if self.load_local_experts:
+            return super().init_experts(input_size, expert_num, expert_dims)
+        return nn.ModuleList()
+
+    @staticmethod
+    def split_state_dict(model_state_dict):
+        tower_state_dicts = {
+            "user": {},
+            "ad": {},
+        }
+        final_ranker_shared_state_dict = {}
+        expert_state_dicts = {}
+        other_state_dict = {}
+
+        for key, value in model_state_dict.items():
+            if key.startswith("towers.user."):
+                tower_state_dicts["user"][key[len("towers.user."):]] = value
+            elif key.startswith("towers.ad."):
+                tower_state_dicts["ad"][key[len("towers.ad."):]] = value
+            elif key.startswith("final_ranker.experts."):
+                suffix = key[len("final_ranker.experts."):]  # e.g. "0.0.weight"
+                expert_id_str, expert_param = suffix.split(".", 1)
+                expert_state_dicts.setdefault(int(expert_id_str), {})[expert_param] = value
+            elif key.startswith("final_ranker."):
+                final_ranker_shared_state_dict[key[len("final_ranker."):]] = value
+            else:
+                other_state_dict[key] = value
+
+        return {
+            "towers": tower_state_dicts,
+            "final_ranker_shared": final_ranker_shared_state_dict,
+            "experts": expert_state_dicts,
+            "other": other_state_dict,
+        }
+
+    def plan_routing(self, x):
+        """
+        Build a sparse routing plan without executing experts.
+
+        Returns:
+            dict: routing plan containing gate weights, selected expert ids, and the
+            per-expert sample indices required to dispatch expert calls externally.
+        """
+        # I x [(B, E)]
+        gate_weights, gate_probs = self.gate_forward(x=x)
+
+        importance = [torch.sum(weights, dim=0) for weights in gate_weights]
+        load = []
+        if self.top_k and self.top_k < self.expert_num:
+            load = [torch.sum(prob, dim=0) for prob in gate_probs]
+
+        sparse_width = self.top_k if self.top_k and self.top_k < self.expert_num else self.expert_num
+        topk_indices = []
+        topk_weights = []
+        # E x [(B, )] where E is a # of experts
+        expert_sample_masks = [torch.zeros(x.shape[0], dtype=torch.bool, device=x.device) for _ in range(self.expert_num)]
+
+        for weights in gate_weights:
+            selected_weights, selected_indices = torch.topk(weights, k=sparse_width, dim=1)
+            selected_weights = selected_weights / (selected_weights.sum(dim=1, keepdim=True) + 1e-9)
+            topk_indices.append(selected_indices)
+            topk_weights.append(selected_weights)
+
+            for expert_id in selected_indices.unique().tolist():
+                # for each expert in E x [(B, )], vector (B, ) is true if sample includes the expert in top-k else false
+                expert_sample_masks[expert_id] |= (selected_indices == expert_id).any(dim=1)
+
+        expert_sample_indices = {}
+        for expert_id, sample_mask in enumerate(expert_sample_masks):
+            if sample_mask.any():
+                # convert expert_sample_masks with boolean vectors to expert_sample_indices with the actual indices
+                expert_sample_indices[expert_id] = sample_mask.nonzero(as_tuple=False).squeeze(-1)
+
+        return {
+            "gate_weights": gate_weights, # I x [(B, E)]
+            "topk_indices": topk_indices, # I x [(B, K)]
+            "topk_weights": topk_weights, # I x [(B, K)]
+            "expert_sample_indices": expert_sample_indices, # E x [(B, )]
+            "importance": importance,
+            "load": load,
+            "batch_size": x.shape[0],
+            "device": x.device,
+            "dtype": x.dtype,
+        }
+
+    def iter_sample_routing(self, x, routing_plan):
+        """
+        Yield per-sample expert requests.
+
+        This representation is intentionally not grouped by expert id so a caller can
+        issue one request per `(sample, expert)` pair and rely on Ray Serve to batch
+        requests that share the same multiplexed model id.
+        """
+        for task_idx, (selected_indices, selected_weights) in enumerate(
+            zip(routing_plan["topk_indices"], routing_plan["topk_weights"])
+        ):
+            for sample_idx in range(selected_indices.shape[0]):
+                sample_input = x[sample_idx]
+                for slot_idx in range(selected_indices.shape[1]):
+                    yield {
+                        "task_idx": task_idx,
+                        "sample_idx": sample_idx,
+                        "slot_idx": slot_idx,
+                        "expert_id": int(selected_indices[sample_idx, slot_idx].item()),
+                        "weight": selected_weights[sample_idx, slot_idx],
+                        "input": sample_input,
+                    }
+
+    def prepare_expert_inputs(self, x, routing_plan):
+        """
+        Create per-expert mini-batches for multiplexed execution.
+
+        The returned tensors preserve the exact row order expected by
+        reduce_expert_outputs.
+        """
+        expert_requests = {}
+        for expert_id, sample_indices in routing_plan["expert_sample_indices"].items():
+            expert_requests[expert_id] = {
+                "inputs": x.index_select(0, sample_indices),
+                "sample_indices": sample_indices,
+            }
+        return expert_requests
+
+    def run_local_experts(self, x, routing_plan):
+        """Execute only requested experts locally for debugging or non-Serve inference."""
+        if len(self.experts) != self.expert_num:
+            raise RuntimeError(
+                "Local experts are not initialized. Set load_local_experts=True or provide external expert outputs."
+            )
+
+        expert_outputs = {}
+        for expert_id, sample_indices in routing_plan["expert_sample_indices"].items():
+            expert_outputs[expert_id] = self.experts[expert_id](x.index_select(0, sample_indices))
+        return expert_outputs
+
+    def reduce_expert_outputs(self, routing_plan, expert_outputs):
+        """
+        Combine expert outputs back into per-task representations and score task heads.
+
+        Args:
+            routing_plan (dict): output from plan_routing.
+            expert_outputs (dict[int, torch.Tensor]): outputs for each requested expert.
+                Each tensor must correspond to the row order from prepare_expert_inputs.
+        """
+        batch_size = routing_plan["batch_size"]
+        runtime_device = routing_plan["device"]
+        runtime_dtype = routing_plan["dtype"]
+        gate_out = [
+            torch.zeros((batch_size, self.expert_dims[-1]), device=runtime_device, dtype=runtime_dtype)
+            for _ in range(len(self.task_dims))
+        ]
+
+        for task_idx, (selected_indices, selected_weights) in enumerate(
+            zip(routing_plan["topk_indices"], routing_plan["topk_weights"])
+        ):
+            for slot in range(selected_indices.shape[1]):
+                slot_expert_ids = selected_indices[:, slot]
+                slot_weights = selected_weights[:, slot]
+
+                for expert_id in slot_expert_ids.unique().tolist():
+                    sample_mask = slot_expert_ids == expert_id
+                    sample_indices = sample_mask.nonzero(as_tuple=False).squeeze(-1)
+                    if sample_indices.numel() == 0:
+                        continue
+
+                    if expert_id not in expert_outputs:
+                        raise KeyError(f"Missing output for expert {expert_id}")
+
+                    expert_sample_indices = routing_plan["expert_sample_indices"][expert_id]
+                    local_rows = torch.searchsorted(expert_sample_indices, sample_indices)
+                    expert_result = expert_outputs[expert_id].to(device=runtime_device, dtype=runtime_dtype)
+                    gate_out[task_idx][sample_indices] += (
+                        slot_weights.index_select(0, sample_indices).unsqueeze(-1)
+                        * expert_result.index_select(0, local_rows)
+                    )
+
+        self.importance = routing_plan["importance"]
+        self.load = routing_plan["load"]
+        return self.task_forward(gate_out)
+
+    def reduce_scattered_expert_outputs(self, routing_plan, routed_outputs):
+        """
+        Reduce per-request expert outputs back into task logits.
+
+        Args:
+            routing_plan (dict): output from plan_routing.
+            routed_outputs (list[dict]): items with keys `task_idx`, `sample_idx`,
+                `weight`, and `output`. This matches the per-sample request style used
+                by Ray Serve when requests are issued independently and batched inside
+                the multiplexed expert deployment.
+        """
+        batch_size = routing_plan["batch_size"]
+        runtime_device = routing_plan["device"]
+        runtime_dtype = routing_plan["dtype"]
+        gate_out = [
+            torch.zeros((batch_size, self.expert_dims[-1]), device=runtime_device, dtype=runtime_dtype)
+            for _ in range(len(self.task_dims))
+        ]
+
+        for routed in routed_outputs:
+            sample_idx = routed["sample_idx"]
+            gate_out[routed["task_idx"]][sample_idx] += routed["weight"].to(
+                device=runtime_device,
+                dtype=runtime_dtype,
+            ) * routed["output"].to(device=runtime_device, dtype=runtime_dtype)
+
+        self.importance = routing_plan["importance"]
+        self.load = routing_plan["load"]
+        return self.task_forward(gate_out)
+
+    def forward(self, x, expert_outputs=None):
+        """
+        Forward pass that supports local sparse execution or externally provided expert outputs.
+
+        Args:
+            x (torch.Tensor): shared input to gates and experts.
+            expert_outputs (dict[int, torch.Tensor] | None): optional external expert
+                outputs keyed by expert id. If omitted, the class will try to execute
+                the requested experts locally.
+        """
+        routing_plan = self.plan_routing(x)
+        if expert_outputs is None:
+            expert_outputs = self.run_local_experts(x, routing_plan)
+        return self.reduce_expert_outputs(routing_plan, expert_outputs)
     
 class EmbeddingLayer(nn.Module):
     """Modularize Embedding layer so the same tables can be shared across DLRMTowers"""
@@ -714,6 +1008,60 @@ class Solver:
         targets = [
             batch["click"].float().unsqueeze(1),
             batch["conversion"].float().unsqueeze(1),
+        ]
+        return x, targets
+
+    @staticmethod
+    def _serve_list_of_ints(value):
+        """Convert tensors/arrays/scalars into plain Python integer lists for JSON payloads."""
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().tolist()
+        elif hasattr(value, "tolist") and not isinstance(value, (list, tuple, dict, str)):
+            value = value.tolist()
+
+        if isinstance(value, tuple):
+            value = list(value)
+
+        if isinstance(value, list):
+            return [int(item) for item in value]
+
+        return [int(value)]
+
+    @staticmethod
+    def _serve_build_x(batch):
+        """Construct the structured x dict expected by FullRanker.forward from a flat collated batch dict.
+        Override this method if your tower/feature split differs.
+        Args:
+            batch (dict[str, list[int]]): flat collated batch from AdsDataset._collate_batch.
+        Returns:
+            tuple[dict, list[list[int]]]: x dict for model, list of target list int per task.
+        """
+        x = {
+            "user": {
+                "dense": None,
+                "emb_indices": {
+                    "uid": Solver._serve_list_of_ints(batch["uid"]),
+                    "last_n_click_campaigns_1D": Solver._serve_list_of_ints(batch["last_n_click_campaigns_1D"]),
+                    "last_n_conversion_campaigns_1D": Solver._serve_list_of_ints(batch["last_n_conversion_campaigns_1D"]),
+                },
+                "emb_offsets": {
+                    "last_n_click_campaigns_1D_offset": Solver._serve_list_of_ints(batch["last_n_click_campaigns_1D_offset"]),
+                    "last_n_conversion_campaigns_1D_offset": Solver._serve_list_of_ints(batch["last_n_conversion_campaigns_1D_offset"]),
+                },
+            },
+            "ad": {
+                "dense": None,
+                "emb_indices": {
+                    k: Solver._serve_list_of_ints(batch[k])
+                    for k in ["campaign"] + [f"cat{i}" for i in range(1, 10)]
+                },
+                "emb_offsets": {},
+            },
+        }
+        # one target list per task head, shaped as [B] for JSON serialization
+        targets = [
+            Solver._serve_list_of_ints(batch["click"]),
+            Solver._serve_list_of_ints(batch["conversion"]),
         ]
         return x, targets
 
