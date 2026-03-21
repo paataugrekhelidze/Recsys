@@ -1,0 +1,25 @@
+project: golden_raven
+# By default, the registry is a file (but can be turned into a more scalable SQL-backed registry)
+# On AWS, minimally you should create a S3 bucket for a remote file registry
+# See https://docs.feast.dev/getting-started/concepts/registry for details
+registry: s3://<BUCKET-NAME>/feast/registry.pb
+# The provider primarily specifies default offline / online stores & storing the registry in a given cloud
+provider: aws
+# See https://docs.feast.dev/reference/online-stores/dynamodb
+online_store:
+   type: dynamodb
+   region: us-west-2
+# See https://docs.feast.dev/reference/online-stores/redis
+#online_store:
+#   type: redis
+#   connection_string: "localhost:6379"
+offline_store:
+    type: redshift
+    # cluster_id: feast-workgroup # used with provisioned redshift cluster
+    workgroup: feast-workgroup # used with serverless redshift
+    region: us-west-2
+    database: dev
+    # user: admin
+    s3_staging_location: s3://<BUCKET-NAME>/feast/criteo/staging
+    iam_role: arn:aws:iam::<ACCOUNT-ID>:role/RedshiftSpectrumRole
+entity_key_serialization_version: 3

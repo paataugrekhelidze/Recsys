@@ -1,0 +1,13 @@
+[project]
+name = "ads-feast"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=4.8.2",
+    "feast[aws]==0.61",
+    "ipykernel>=7.2.0",
+    "polars>=1.39.2",
+    "s3fs>=2024.9.0",
+]
