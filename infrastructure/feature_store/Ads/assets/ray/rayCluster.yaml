@@ -1,0 +1,62 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: ray-compute-engine
+spec:
+  rayVersion: '2.54.0'
+  enableInTreeAutoscaling: true   # must be enabled to allow pod replica scaling. When enabled, KubeRay operator automatically configures an autoscaling sidecar container for the Ray head Pod.
+  autoscalerOptions:
+    upscalingMode: Default
+    idleTimeoutSeconds: 60
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+      num-cpus: "0"        # head is control-plane only
+    template:
+      spec:
+        serviceAccountName: ray-s3-sa
+        # force head pod to go to a node with the following label
+        # Pin head to head node group
+        nodeSelector:
+          role: ray-head
+        # Must tolerate the custom taint of the k8s head node group
+        # even if the ray pod wants to be scheduled on a head node, it needs the following toleration to be allowed
+        # an actual physical node has a node-taint to prevent worker pods from being scheduled on the node
+        tolerations:
+          - key: role
+            value: ray-head
+            operator: Equal
+            effect: NoSchedule
+        containers:
+          - name: ray-head
+            image: rayproject/ray:2.54.0-py312
+            resources:
+              requests: { cpu: "1", memory: "3Gi" }
+              limits:   { cpu: "2", memory: "4Gi" }
+  workerGroupSpecs:
+      - groupName: ray-workers
+        replicas: 2
+        minReplicas: 2
+        maxReplicas: 4 # autoscaler can scale up to 4 pods, since each worker pod is forced to run on a unique node, every time a new pod is added, it will consume a new physical machine
+        template:
+          spec:
+            affinity:
+              podAntiAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  - labelSelector:
+                      matchLabels:
+                        ray.io/group: ray-workers   # KubeRay sets this label automatically
+                    # forces to only schedule a single instance of ray-worker pod per K8s node (1 K8s node = 1 Ray pod). Ray doc recommendation.
+                    # https://docs.ray.io/en/latest/cluster/kubernetes/user-guides/k8s-autoscaler.html#ray-autoscaler-with-kubernetes-cluster-autoscaler
+                    topologyKey: kubernetes.io/hostname
+            serviceAccountName: ray-s3-sa
+            nodeSelector:
+              # worker pods are scheduled on nodes labeled with role: ray-worker
+              role: ray-worker
+            containers:
+              - name: ray-worker
+                image: rayproject/ray:2.54.0-py312
+                resources:
+                  requests: { cpu: "2", memory: "8Gi" }
+                  # alternative way to force a single pod on an m5.xlarge instance
+                  # requests: { cpu: "4", memory: "16Gi" }
