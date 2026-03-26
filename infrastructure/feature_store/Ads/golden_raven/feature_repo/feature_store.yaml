@@ -2,7 +2,8 @@ project: golden_raven
 # By default, the registry is a file (but can be turned into a more scalable SQL-backed registry)
 # On AWS, minimally you should create a S3 bucket for a remote file registry
 # See https://docs.feast.dev/getting-started/concepts/registry for details
-registry: s3://<BUCKET-NAME>/feast/registry.pb
+# better to us sql-based registry to support concurrent writes from multiple clients
+registry: s3://<MY-BUCKET>/feast/registry.pb
 # The provider primarily specifies default offline / online stores & storing the registry in a given cloud
 provider: aws
 # See https://docs.feast.dev/reference/online-stores/dynamodb
@@ -15,11 +16,39 @@ online_store:
 #   connection_string: "localhost:6379"
 offline_store:
     type: redshift
-    # cluster_id: feast-workgroup # used with provisioned redshift cluster
-    workgroup: feast-workgroup # used with serverless redshift
+    # cluster_id: <MY-CLUSTER-ID> # use for provisioned redshift cluster
+    workgroup: feast-workgroup # use for serverless redshift
     region: us-west-2
     database: dev
-    # user: admin
-    s3_staging_location: s3://<BUCKET-NAME>/feast/criteo/staging
+    s3_staging_location: s3://<MY-BUCKET>/feast/criteo/redshift/staging
     iam_role: arn:aws:iam::<ACCOUNT-ID>:role/RedshiftSpectrumRole
+#   type: ray
+#   storage_path: s3://MY-BUCKET/feast/criteo/ray/storage
+#   ray_address: "ray://127.0.0.1:10001"
+#   broadcast_join_threshold_mb: 100
+#   max_parallelism_multiplier: 2
+#   target_partition_size_mb: 64
+#   window_size_for_joins: "2H"
+#   enable_distributed_joins: true
+# Ray compute engine for distributed feature processing
+# batch_engine:
+#     type: ray.engine
+    
+#     # Resource configuration
+#     max_workers: 8                             # Maximum number of Ray workers
+#     max_parallelism_multiplier: 2              # Parallelism as multiple of CPU cores
+    
+#     # Performance optimization
+#     enable_optimization: true                  # Enable performance optimizations
+#     broadcast_join_threshold_mb: 100           # Broadcast join threshold (MB)
+#     target_partition_size_mb: 64               # Target partition size (MB)
+    
+#     # Distributed join configuration
+#     window_size_for_joins: "2H"                # Time window for distributed joins
+#     enable_distributed_joins: true            # Enable distributed joins
+    
+#     # Ray cluster configuration
+#     # ray_address: "ray://ray-compute-engine-head-svc:10001" # if feast runs inside the same k8s namespace
+#     ray_address: "ray://127.0.0.1:10001" # port forward to localhost
+#     staging_location: s3://<MY-BUCKET>/feast/criteo/ray/staging   # Remote staging location for ray compute engine
 entity_key_serialization_version: 3

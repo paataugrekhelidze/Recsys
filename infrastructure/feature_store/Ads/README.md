@@ -2,14 +2,14 @@
 Goal of the repository is to introduce an interface that connects raw data from previous ads related exercises to training and serving pipelines. Feast is a feature store that offers many capabilities: feature repository for versioning and collaboration, consistency between training and inference features, schema validation, point in time correctness (prevents data leakage), plugins to efficiently generate training data (spark or ray engine), a method to "materialize" latest feature values to an online store (e.g. DynamoDB) for a quick retrieval during inference, and more. 
 
 #### Pipeline
-1. Data source coming from s3 (e.g. parquet files) - phase 1
-2. Redhsift used as an offline store for batch features, which uses spectrum to scan the parquet files in s3 - phase 1
-3. Airflow schedule (train): starts training data generation process (using get_historical_features() in Feast) -> starts model training process (ray.Train DDP or FSDP) -> uploads updated model parameters to mlflow (model repository, save tha pointer to the featureService to keep the features consistent with the model) - phase 2
-4. Airflow schedule (serve): CI job that loads updated parameters online with zero downtime (ray serve) - phase 2
-5. Airflow schedule (online features): schedule batch feature sync from offline store to online store (latest batch features) - phase 3
-6. Pushing streaming data (kafka + Flink) to offline (training) and online store (cache for inference) as they arrive (e.g. clicks and conversions) - phase 3
-7. Prediction service that combines data from online store (streaming and batch) and on demand (at request-time) on a batch of data and returns scores across multiple tasks (CTR, CVR) - phase 2-3
-
+1. Data source coming from s3 (e.g. parquet files created in preprocess.ipynb) - phase 1
+2. ETL job (ideally created via scheduler) using ray distributed computing. Raw data in s3 is used to perform sequential window aggregation and mapping of ordinalEncoder. All transformations should ideally be pushed to offline etl jobs to improve online performance. Transformed data is written to another path in s3.
+3. Redshift spectrum (via Glue crawler) reads data directly from s3. Feast uses redshift as offline_store to perform point-in-time joins to generate training data. - phase 1
+4. Airflow schedule (train): starts training data generation process (using get_historical_features() in Feast) -> starts model training process (ray.Train DDP or FSDP) -> uploads updated model parameters to mlflow (model repository, save tha pointer to the featureService to keep the features consistent with the model) - phase 2
+5. Airflow schedule (serve): CI job that loads updated parameters online with zero downtime (ray serve) - phase 2
+6. Airflow schedule (online features): Feast materialize/materialize-incremental will generate latest feature values and push data to online-store (DynamoDB) for quick retrieval. Compute engine (Ray) can be used to generate onDemandFeature transformations (avoid if possible) - phase 3
+7. Pushing streaming data (kafka + Flink) to offline (training) and online store (cache for inference) as they arrive (e.g. clicks and conversions) - phase 3
+8. Prediction service that combines data from online store (streaming and batch) and on demand (at request-time) on a batch of data and returns scores across multiple tasks (CTR, CVR) - phase 2-3
 
 #### Configure Glue data catalog
 Auto-detects partitions and registers the schema. Redshift spectrum needs the schema from Glue data catalog to read data from s3
@@ -48,7 +48,7 @@ aws glue create-crawler \
   --role $GLUE_ROLE_ARN \
   --database-name criteo_db \
   --region us-west-2 \
-  --targets '{"S3Targets": [{"Path": "s3://<BUCKET-NAME>/criteo/unprocessed/"}]}' \
+  --targets '{"S3Targets": [{"Path": "s3://<MY-BUCKET>/feast/criteo/transformed/features/"}]}' \
   --configuration '{"Version":1.0,"CrawlerOutput":{"Partitions":{"AddOrUpdateBehavior":"InheritFromTable"}}}'
 
 # should partition by day (31)
@@ -141,7 +141,18 @@ aws redshift-data execute-statement \
     IAM_ROLE '${REDSHIFT_ROLE_ARN}' \
     REGION 'us-west-2';"
 
-# # # drop if needed
+# need to create a local table otherwise feast get_historical_features does not work with spectrum
+aws redshift-data execute-statement \
+    --workgroup-name feast-workgroup \
+    --region us-west-2 \
+    --database dev \
+    --sql "DROP TABLE IF EXISTS public.temp_feast_entities; \
+           CREATE TABLE public.temp_feast_entities AS \
+           SELECT * \
+           FROM criteo.features \
+           WHERE (year='2026' AND month='03' AND day='20');"
+
+# drop if needed
 # aws redshift-data execute-statement \
 #     --workgroup-name feast-workgroup \
 #     --region us-west-2 \
@@ -156,28 +167,11 @@ aws redshift-data execute-statement \
     --workgroup-name feast-workgroup \
     --region us-west-2 \
     --database dev \
-    --sql "SELECT * from criteo.unprocessed LIMIT 1;"
+    --sql "SELECT * from criteo.features LIMIT 1;"
 
-
-# aws redshift-data execute-statement \
-#     --workgroup-name feast-workgroup \
-#     --region us-west-2 \
-#     --database dev \
-#     --sql "SELECT
-#                 uid,
-#                 event_timestamp
-#             FROM (SELECT * FROM criteo.unprocessed)
-#             WHERE event_timestamp BETWEEN TIMESTAMP '2026-03-15 19:00:00+00:00' AND TIMESTAMP '2026-03-20 19:00:00+00:00'"
 
 # print the query result
 aws redshift-data get-statement-result --id <STATEMENT-ID> --region us-west-2
-
-
-# CREATE EXTERNAL SCHEMA criteo
-# FROM DATA CATALOG
-# DATABASE 'criteo_db'
-# IAM_ROLE 'arn:aws:iam::<ACCOUNT-ID>:role/RedshiftSpectrumRole'
-# REGION 'us-west-2';
 ```
 
 
@@ -198,10 +192,11 @@ uv add 'feast[aws]==0.61'
 feast init -t aws
 
 # apply config, creates registry.pb, centralized definitions for features views, entities, data sources...
+# make sure to port-forward ray client to localhost 10001 for ray batch engine to connect to the ray cluster, see assets/ray/README.md
 feast apply
 
 # push data from offline store (redshift) to online store (DynamoDB)
-feast materialize 2026-03-19T00:00:00 2026-03-20T00:00:00
+feast materialize 2026-03-20T00:00:00 2026-03-25T00:00:00
 ```
 
 #### Links

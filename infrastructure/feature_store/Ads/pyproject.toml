@@ -9,5 +9,7 @@ dependencies = [
     "feast[aws]==0.61",
     "ipykernel>=7.2.0",
     "polars>=1.39.2",
+    "ray[client,data]>=2.54.0",
     "s3fs>=2024.9.0",
+    "scikit-learn>=1.8.0",
 ]
