@@ -4,6 +4,7 @@ import polars as pl
 from datetime import datetime, timedelta
 import os
 from ray.data.datasource.partitioning import PathPartitionFilter
+import joblib
 
 # Initialize Ray (connects to the cluster defined in rayCluster.yaml)
 ray.init(
@@ -26,88 +27,123 @@ end_date = datetime.strptime(end_date, format_string)
 start_date = end_date - timedelta(days=window_days)
 dates_to_read = list(daterange(start_date, end_date))
 
-def compute_rolling_windows(user_df, days: int, end_date: datetime):
-    """Computes the last 5 unique campaigns clicked/converted in a window."""
 
-    if not isinstance(user_df, pl.DataFrame):
-        user_df = pl.from_arrow(user_df)
+class WindowAggregator:
+    def __init__(self, window_days, end_date):
+        import joblib
+        # Loaded once per worker, not serialized over the network
+        self.V = joblib.load("ordinal_encoders.joblib") 
+        self.window_days = window_days
+        self.end_date = end_date
+        self.columns_to_encode = [
+            'uid', 'campaign', 'cat1', 'cat2', 'cat3', 'cat4', 'cat5', 'cat6', 'cat7', 'cat8', 'cat9'
+        ]
+
+        # Categorize columns by their cardinality
+        self.low_card_cols = ['campaign', 'cat1', 'cat2', 'cat3', 'cat4', 'cat5', 'cat6', 'cat8', 'cat9']
+        self.high_card_cols = ['cat7']
+
+        # workaround because directly applying scikit to polars datafram is really slow 
+        self.join_maps = {}
+        self.replace_maps = {}
+        for col in self.columns_to_encode:
+            encoder = self.V[col]
+            # Handle both Scikit-Learn OrdinalEncoder and LabelEncoder types
+            classes = encoder.categories_[0] if hasattr(encoder, 'categories_') else encoder.classes_
+
+            if col in self.high_card_cols:
+                # Create a 2-column DataFrame: [Original Value, Encoded Value]
+                self.join_maps[col] = pl.DataFrame({
+                    col: classes,
+                    f"{col}_encoded": [int(i) for i in range(len(classes))]
+                })
+            else:
+                self.replace_maps[col] = {val: int(i) for i, val in enumerate(classes)}
+
+    def __call__(self, user_df):
+        """Computes the last 5 unique campaigns clicked/converted in a window."""
+
+        if not isinstance(user_df, pl.DataFrame):
+            user_df = pl.from_arrow(user_df)
+        
+        # Fail fast if the upstream data contract is broken
+        assert user_df.schema["event_timestamp"] in (pl.Datetime, pl.Datetime("us")), \
+            "Data pipeline error: event_timestamp is not a Datetime object"
+
+        user_df = user_df.sort('event_timestamp')
+        last_5_clicks = []
+        last_5_conversions = []
+        timestamps = user_df['event_timestamp']
+
+        # Since grouped by uid, all rows in this block have the same ID.
+        current_uid = user_df['uid'][0]
+        encoded_uid = self.replace_maps['uid'].get(current_uid, self.V['uid'].unknown_value)
+        user_df = user_df.with_columns(pl.lit(encoded_uid).alias('uid'))
+
+        # transform campaign column only to avoid many cols for last_5_click and last_5_conversion columns
+        
+        # slow scikit-learn trasform
+        # user_df = user_df.with_columns([
+        #     pl.Series("campaign", self.V["campaign"].transform(user_df["campaign"].to_numpy().reshape(-1, 1)).flatten())
+        # ])
+
+        # # faster, left join
+        # user_df = user_df.join(self.mappings["campaign"], on="campaign", how="left")
+        # # fill Nulls with the default unknown value, drop extra column
+        # user_df = user_df.with_columns(
+        #     pl.col("campaign_encoded").fill_null(self.V["campaign"].unknown_value).alias("campaign")
+        # ).drop("campaign_encoded")
+
+        # fastes on low cardinality, Replace 'campaign' (675 values) instantly
+        user_df = user_df.with_columns(
+            pl.col("campaign").replace(self.replace_maps["campaign"], default=self.V["campaign"].unknown_value)
+        )
+
+        # For each (uid, timestamp)
+        for idx in range(user_df.height):
+            current_time = timestamps[idx]
+            # Get uid data within the appropriate range
+            cutoff_time = current_time - pl.duration(days=self.window_days)
+            mask = (timestamps >= cutoff_time) & (timestamps < current_time)
+            window_df = user_df.filter(mask)
+            # Last 5 unique campaigns for clicks
+            click_campaigns = window_df.filter(pl.col('click') == 1)['campaign'].unique()[-5:]
+            last_5_clicks.append(",".join([str(x) for x in click_campaigns]))
+            # Last 5 unique campaigns for conversions
+            conv_campaigns = window_df.filter(pl.col('conversion') == 1)['campaign'].unique()[-5:]
+            last_5_conversions.append(",".join([str(x) for x in conv_campaigns]))
+
+        user_df = user_df.with_columns([
+            pl.Series('last_5_clicks', last_5_clicks),
+            pl.Series('last_5_conversions', last_5_conversions)
+        ])
+
+        # only return date range that was submitted
+        # ETL outputs jobs for a single day
+        user_df = user_df.filter(
+            (pl.col('event_timestamp') >= self.end_date) & (pl.col('event_timestamp') < self.end_date + timedelta(days=1))
+        )
+        
+        # transform other columns on smaller data
+        
+        # High Cardinality Join (cat7)
+        user_df = user_df.join(self.join_maps["cat7"], on="cat7", how="left")
+
+        # Low Cardinality Batch Replace (cat1-6, 8-9)
+        replace_exprs = [
+            pl.col(col).replace(self.replace_maps[col], default=self.V[col].unknown_value)
+            for col in self.low_card_cols if col != 'campaign'
+        ]
+
+        user_df = user_df.with_columns(
+            replace_exprs + [
+                pl.col("cat7_encoded").fill_null(self.V["cat7"].unknown_value).alias("cat7")
+            ]
+        ).drop("cat7_encoded")
+
+
+        return user_df.to_arrow()
     
-    # Fail fast if the upstream data contract is broken
-    assert user_df.schema["event_timestamp"] in (pl.Datetime, pl.Datetime("us")), \
-        "Data pipeline error: event_timestamp is not a Datetime object"
-
-    user_df = user_df.sort('event_timestamp')
-    last_5_clicks = []
-    last_5_conversions = []
-    timestamps = user_df['event_timestamp']
-
-    # For each (uid, timestamp)
-    for idx in range(user_df.height):
-        current_time = timestamps[idx]
-        # Get uid data within the appropriate range
-        cutoff_time = current_time - pl.duration(days=days)
-        mask = (timestamps >= cutoff_time) & (timestamps < current_time)
-        window_df = user_df.filter(mask)
-        # Last 5 unique campaigns for clicks
-        click_campaigns = window_df.filter(pl.col('click') == 1)['campaign'].unique()[-5:]
-        last_5_clicks.append(",".join([str(x) for x in click_campaigns]))
-        # Last 5 unique campaigns for conversions
-        conv_campaigns = window_df.filter(pl.col('conversion') == 1)['campaign'].unique()[-5:]
-        last_5_conversions.append(",".join([str(x) for x in conv_campaigns]))
-
-    user_df = user_df.with_columns([
-        pl.Series('last_5_clicks', last_5_clicks),
-        pl.Series('last_5_conversions', last_5_conversions)
-    ])
-
-
-    # only return date range that was submitted
-    # ETL outputs jobs for a single day
-    return user_df.filter(
-        (pl.col('event_timestamp') >= end_date) & (pl.col('event_timestamp') < end_date + timedelta(days=1))
-    ).to_arrow()
-    
-    # alternative implementation, although it takes the same amount of time
-    # window_str = f"{days}d"
-    # def get_state(df, filter_col, new_name):
-    #     return (
-    #         df.filter(pl.col(filter_col) == 1)
-    #         .rolling(
-    #             index_column="event_timestamp", 
-    #             period=window_str,
-    #             closed="right"
-    #         )
-    #         .agg(
-    #             # Get unique campaigns, maintain chronological order, take last 5
-    #             pl.col("campaign").unique(maintain_order=True).tail(5).alias(new_name)
-    #         )
-    #     )
-
-    # click_state = get_state(user_df, "click", "last_5_clicks")
-    # conv_state = get_state(user_df, "conversion", "last_5_conversions")
-    
-    # # Join States back to Main DataFrame (Point-in-Time Join)
-    # # strategy='backward' ensures we only see data from BEFORE the current timestamp
-    # user_df = user_df.join_asof(
-    #     click_state, 
-    #     on="event_timestamp", 
-    #     # by="uid", 
-    #     strategy="backward"
-    # ).join_asof(
-    #     conv_state, 
-    #     on="event_timestamp", 
-    #     # by="uid", # batch is already grouped by id, this is redundant
-    #     strategy="backward"
-    # )
-
-    # return (
-    #     user_df.with_columns([
-    #         pl.col("last_5_clicks").fill_null(pl.lit([], dtype=pl.List(pl.Utf8))),
-    #         pl.col("last_5_conversions").fill_null(pl.lit([], dtype=pl.List(pl.Utf8)))
-    #     ])
-    #     .filter(pl.col('event_timestamp').is_between(start_date, end_date))
-    #     .to_arrow()
-    # )
 
 date_filter = PathPartitionFilter.of(
     style="hive",
@@ -141,12 +177,11 @@ transformed_ds = raw_ds.groupby(
     'uid', 
     #num_partitions=16 # hash(uid) % num_partitions - a block id that all uid data will be assigned to.
     ).map_groups(
-    lambda df: compute_rolling_windows(
-        df, 
-        days=window_days,
-        # start_date = start_date,
-        end_date = end_date
-    ), 
+    WindowAggregator,
+    fn_constructor_kwargs={
+        "window_days": window_days,
+        "end_date": end_date
+    }, 
     batch_format='pyarrow'
 )
 

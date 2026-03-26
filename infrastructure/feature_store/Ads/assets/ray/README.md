@@ -63,13 +63,15 @@ aws iam create-policy \
     ]
   }'
 
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
 # Create a K8s service account linked to a policy
 eksctl create iamserviceaccount \
   --name ray-s3-sa \
   --namespace default \
   --cluster feast-ray-cluster \
   --region us-west-2 \
-  --attach-policy-arn arn:aws:iam::<ACCOUNT-ID>:policy/FeastRayClusterS3ScopedPolicy \
+  --attach-policy-arn arn:aws:iam::${ACCOUNT_ID}:policy/FeastRayClusterS3ScopedPolicy \
   --approve
 
 # node group for system pods
@@ -122,7 +124,7 @@ eksctl create iamserviceaccount \
   --namespace kube-system \
   --cluster feast-ray-cluster \
   --region us-west-2 \
-  --attach-policy-arn arn:aws:iam::<ACCOUNT-ID>:policy/ClusterAutoscalerPolicy \
+  --attach-policy-arn arn:aws:iam::${ACCOUNT_ID}:policy/ClusterAutoscalerPolicy \
   --approve \
   --override-existing-serviceaccounts
 
@@ -172,12 +174,12 @@ ray job submit \
 --address http://localhost:8265 \
 --working-dir . \
 --runtime-env-json '{
-    "pip": ["polars"],
+    "pip": ["polars", "joblib", "scikit-learn"],
     "env_vars": {
       "WINDOW_DAYS": "2",
       "END_DATE": "2026-03-20"
     },
-    "excludes": ["rayCluster.yaml", "README.md", "ordinal_encoders.joblib"]
+    "excludes": ["rayCluster.yaml", "README.md"]
   }' \
 -- python ray_job.py
 ```
